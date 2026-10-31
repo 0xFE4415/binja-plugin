@@ -10,6 +10,7 @@ import contextlib
 import io
 import re
 from collections import deque
+from collections.abc import Iterator
 from typing import Annotated, Literal
 
 import binaryninja
@@ -88,7 +89,9 @@ def _function_entry(function: Function) -> dict[str, object]:
     return {"start": hex(function.start), "name": _truncate(function.name)}
 
 
-def _iter_mlil_constants(instruction: MediumLevelILInstruction):
+def _iter_mlil_constants(
+    instruction: MediumLevelILInstruction,
+) -> Iterator[MediumLevelILInstruction]:
     if instruction.operation in (
         MediumLevelILOperation.MLIL_CONST,
         MediumLevelILOperation.MLIL_CONST_PTR,
@@ -158,8 +161,14 @@ def rex_call_paths(
             elif neighbor.start not in visited:
                 visited.add(neighbor.start)
                 queue.append((neighbor, [*path, neighbor]))
-    truncated = hit_path_cap or len(paths) > max_paths or (len(paths) >= max_paths and bool(queue))
-    return {"reachable": bool(paths), "paths": paths, "truncated": truncated, "explored": explored}
+    # hit_path_cap is the only truncation signal: paths can never exceed max_paths (the inner
+    # loop breaks first), and reaching max_paths only happens through that same append.
+    return {
+        "reachable": bool(paths),
+        "paths": paths,
+        "truncated": hit_path_cap,
+        "explored": explored,
+    }
 
 
 @mcp.tool(read_only=True)
@@ -170,6 +179,8 @@ def rex_constant_find(
     limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
 ) -> dict[str, object]:
     """Find functions whose MLIL references an immediate constant value.
+
+    Each function reports at most the first 6 matching instruction addresses.
 
     :param value: Immediate value to search for, e.g. 31337 or 65534.
     :param function_filter: Case-insensitive regular expression matched against function names.
@@ -279,9 +290,16 @@ def rex_eval_python(call: mcp.ToolCall, code: str) -> dict[str, object]:
         "bn": binaryninja,
     }
     buffer = io.StringIO()
+    has_result = False
+    raw_result: str | None = None
     try:
         with contextlib.redirect_stdout(buffer):
             exec(code, namespace)
+        has_result = "result" in namespace
+        if has_result:
+            # repr() inside the try: a raising __repr__ must take the error path below, not
+            # escape the handler and drop the captured stdout.
+            raw_result = repr(namespace["result"])
     except Exception as error:
         # Keep failures out of the mcp layer's uncapped str(error) ToolError path.
         stdout, stdout_truncated = _truncate_with_flag(buffer.getvalue(), _MAX_EVAL_STDOUT_CHARS)
@@ -295,10 +313,8 @@ def rex_eval_python(call: mcp.ToolCall, code: str) -> dict[str, object]:
             "error_truncated": error_truncated,
         }
     stdout, stdout_truncated = _truncate_with_flag(buffer.getvalue(), _MAX_EVAL_STDOUT_CHARS)
-    if "result" in namespace:
-        result, result_truncated = _truncate_with_flag(
-            repr(namespace["result"]), _MAX_EVAL_RESULT_CHARS
-        )
+    if has_result and raw_result is not None:
+        result, result_truncated = _truncate_with_flag(raw_result, _MAX_EVAL_RESULT_CHARS)
     else:
         result, result_truncated = None, False
     return {
@@ -360,7 +376,8 @@ def rex_hlil_grep(
     """Search rendered HLIL text across functions with a regular expression.
 
     Regular expressions run on Python's ``re`` with no timeout, so a pattern with
-    catastrophic backtracking can stall the scan.
+    catastrophic backtracking can stall the scan. Each function reports at most the
+    first 3 matching HLIL lines.
 
     :param regex: Regular expression applied to every rendered HLIL line.
     :param function_filter: Case-insensitive regular expression matched against function names.

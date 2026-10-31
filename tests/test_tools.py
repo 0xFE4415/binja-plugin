@@ -139,7 +139,7 @@ def test_data_find_reports_overlapping_matches() -> None:
     assert result["total"] == 3
 
 
-def test_data_find_deduplicates_across_chunk_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_data_find_finds_matches_across_chunk_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tools, "_READ_CHUNK", 4)
     view = FakeBinaryView(
         segments=[FakeSegment(0x1000, 8)],
@@ -149,6 +149,33 @@ def test_data_find_deduplicates_across_chunk_boundaries(monkeypatch: pytest.Monk
     result = find(_call(view), pattern="33 eb")
     assert result["total"] == 2
     assert result["matches"] == ["0x1002", "0x1006"]
+
+
+def test_data_find_matches_straddling_chunk_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tools, "_READ_CHUNK", 4)
+    _, find = get_tool("rex_data_find")
+    # A match straddling the chunk edge is only visible because each read extends
+    # pattern_length - 1 bytes past the chunk; dropping that overlap must fail this test.
+    straddle = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 8)],
+        memory={0x1000: b"\x00\x00\x00\x33\xeb\x00\x00\x00"},
+    )
+    assert find(_call(straddle), pattern="33 eb") == {
+        "total": 1,
+        "truncated": False,
+        "matches": ["0x1003"],
+    }
+    # A match starting exactly at the chunk edge is reported once: the reads overlap, but
+    # every match start belongs to exactly one read.
+    boundary = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 8)],
+        memory={0x1000: b"\x00\x00\x00\x00\x33\xeb\x00\x00"},
+    )
+    assert find(_call(boundary), pattern="33 eb") == {
+        "total": 1,
+        "truncated": False,
+        "matches": ["0x1004"],
+    }
 
 
 def test_data_find_finds_matches_after_chunk_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -524,6 +551,27 @@ def test_eval_python_truncates_stdout_and_result() -> None:
     assert result["result"].startswith("'" + "y" * 10)
     assert len(result["result"]) == tools._MAX_EVAL_RESULT_CHARS + len("... [12 chars truncated]")
     assert result["error"] is None
+
+
+def test_eval_python_survives_result_repr_raising() -> None:
+    view = _view_with_functions()
+    _, evaluate = get_tool("rex_eval_python")
+    # An object whose repr() raises must land in the structured error path, not escape the
+    # handler; the stdout captured before the failure is still returned.
+    result = evaluate(
+        _call(view),
+        "print('before')\n"
+        "class Exploding:\n"
+        "    def __repr__(self):\n"
+        "        raise RuntimeError('no repr')\n"
+        "result = Exploding()",
+    )
+    assert result["stdout"] == "before\n"
+    assert result["result"] is None
+    assert result["result_truncated"] is False
+    assert result["error"] is not None
+    assert "no repr" in result["error"]
+    assert result["error_truncated"] is False
 
 
 def test_eval_python_returns_truncated_error_instead_of_raising() -> None:

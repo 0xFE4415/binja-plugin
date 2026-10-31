@@ -41,7 +41,9 @@ clients that already connected must reconnect to see the registered `rex_*` tool
 | `rex_eval_python` | Arbitrary `binaryninja` Python scripting (destructive escape hatch). |
 
 Search tools return `total`, `truncated`, and paginated results via `limit`/`offset` so
-agents never need to page through unbounded listings.
+agents never need to page through unbounded listings. Echoed strings (names, tag data, key
+values, `rex_eval_python` output) are additionally capped in length, with a
+`... [N chars truncated]` suffix and a companion `*_truncated` flag whenever a cap bites.
 
 ## Known limits
 

@@ -5,7 +5,7 @@ import pytest
 from binja_plugin.hexpattern import HexPatternError, compile_hex_pattern, parse_hex_pattern
 
 
-@pytest.mark.parametrize("pattern", ["", "   ", "4", "48 8", "zz", "48 8z"])
+@pytest.mark.parametrize("pattern", ["", "   ", "4", "48 8", "zz", "48 8z", "48 8\nz"])
 def test_parse_rejects_invalid_patterns(pattern: str) -> None:
     with pytest.raises(HexPatternError):
         parse_hex_pattern(pattern)
@@ -19,6 +19,9 @@ def test_parse_rejects_invalid_patterns(pattern: str) -> None:
         ("48 8B", [0x48, 0x8B]),
         ("??", [None]),
         ("a5 ?? 05", [0xA5, None, 0x05]),
+        # Any whitespace is a separator, including trailing newlines from copy-pasted patterns.
+        ("48 8b\n", [0x48, 0x8B]),
+        ("48\n\t8b\r", [0x48, 0x8B]),
     ],
 )
 def test_parse_accepts_valid_patterns(pattern: str, expected: list[int | None]) -> None:

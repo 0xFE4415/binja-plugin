@@ -18,7 +18,7 @@ def parse_hex_pattern(pattern: str) -> list[int | None]:
     :returns: One entry per byte; None marks a wildcard byte.
     :raises HexPatternError: The pattern is empty, truncated, or has non-hex tokens.
     """
-    cleaned = pattern.replace(" ", "").replace("\t", "")
+    cleaned = "".join(pattern.split())
     if not cleaned:
         raise HexPatternError("empty hex pattern")
     if len(cleaned) % 2 != 0:
