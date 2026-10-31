@@ -34,12 +34,18 @@ class FakeIntegerExpression(int):
     pass
 
 
-class FakeClampTo:
-    """Mirrors binaryninja.mcp.ClampTo; the fake decorator does not apply clamping."""
+class FakeMinimum:
+    """Mirrors binaryninja.mcp.Minimum; the fake decorator does not apply rejection."""
 
-    def __init__(self, minimum: int, maximum: int) -> None:
-        self.minimum = minimum
-        self.maximum = maximum
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+
+class FakeMaximum:
+    """Mirrors binaryninja.mcp.Maximum; the fake decorator does not apply rejection."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
 
 
 class FakeToolCallBase:
@@ -56,7 +62,8 @@ def install_fake_binaryninja() -> None:
     setattr(mcp_module, "IntegerExpression", FakeIntegerExpression)
     setattr(mcp_module, "ToolCall", FakeToolCallBase)
     setattr(mcp_module, "ToolError", FakeToolError)
-    setattr(mcp_module, "ClampTo", FakeClampTo)
+    setattr(mcp_module, "Minimum", FakeMinimum)
+    setattr(mcp_module, "Maximum", FakeMaximum)
     setattr(
         mcp_module,
         "McpToolScope",

@@ -41,8 +41,11 @@ clients that already connected must reconnect to see the registered `rex_*` tool
 | `rex_eval_python` | Arbitrary `binaryninja` Python scripting (destructive escape hatch). |
 
 Search tools return `total`, `truncated`, and paginated results via `limit`/`offset` so
-agents never need to page through unbounded listings. Echoed strings (names, tag data, key
-values, `rex_eval_python` output) are additionally capped in length, with a
+agents never need to page through unbounded listings. Size parameters (`limit`, `offset`,
+`max_depth`, `max_paths`, `max_functions`, `max_chars`) are range-checked, not silently
+normalized: a value outside its documented range — including above the resource cap — is
+rejected with the MCP layer's `invalid_params` argument error. Echoed strings (names, tag
+data, key values, `rex_eval_python` output) are additionally capped in length, with a
 `... [N chars truncated]` suffix and a companion `*_truncated` flag whenever a cap bites.
 
 ## Known limits

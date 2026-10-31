@@ -99,10 +99,18 @@ def test_string_search_caps_limit() -> None:
     strings = [FakeStringReference(f"s{index}", 0x1000 + index) for index in range(600)]
     view = FakeBinaryView(strings=strings)
     _, search = get_tool("rex_string_search")
-    result = search(_call(view), limit=100000)
+    # Exactly at the cap the limit is honored; the scan stops one match past the window.
+    result = search(_call(view), limit=tools._MAX_LIMIT)
     assert result["total"] == tools._MAX_LIMIT + 1
     assert len(result["strings"]) == tools._MAX_LIMIT
     assert result["truncated"] is True
+    # Past the cap the request is rejected, not silently normalized.
+    with pytest.raises(FakeToolError) as exc:
+        search(_call(view), limit=tools._MAX_LIMIT + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+    )
 
 
 def test_string_search_truncates_long_values() -> None:
@@ -142,6 +150,16 @@ def test_string_search_errors() -> None:
         search(_call(view), section="s" * 1000)
     assert exc.value.code == "section_not_found"
     assert "chars truncated]" in exc.value.message
+    with pytest.raises(FakeToolError) as exc:
+        search(_call(view), limit=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    with pytest.raises(FakeToolError) as exc:
+        search(_call(view), limit=tools._MAX_LIMIT + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+    )
 
 
 def test_data_find_finds_pattern_and_wildcards() -> None:
@@ -255,10 +273,18 @@ def test_data_find_caps_limit() -> None:
         memory={0x1000: b"\x90" * 600},
     )
     _, find = get_tool("rex_data_find")
-    result = find(_call(view), pattern="90", limit=100000)
+    # Exactly at the cap the limit is honored; the scan stops one match past the window.
+    result = find(_call(view), pattern="90", limit=tools._MAX_LIMIT)
     assert len(result["matches"]) == tools._MAX_LIMIT
     assert result["total"] == tools._MAX_LIMIT + 1
     assert result["truncated"] is True
+    # Past the cap the request is rejected, not silently normalized.
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), pattern="90", limit=tools._MAX_LIMIT + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+    )
 
 
 def test_data_find_skips_unreadable_segments() -> None:
@@ -333,6 +359,21 @@ def test_constant_find_filter_and_limit() -> None:
     assert len(limited["functions"]) == 1
 
 
+def test_constant_find_rejects_out_of_range_limit() -> None:
+    view = _view_with_functions()
+    _, find = get_tool("rex_constant_find")
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), value=1, limit=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), value=1, limit=tools._MAX_LIMIT + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+    )
+
+
 def test_constant_find_caps_limit_and_truncates_names() -> None:
     operation = binaryninja.MediumLevelILOperation
 
@@ -348,7 +389,7 @@ def test_constant_find_caps_limit_and_truncates_names() -> None:
     ]
     view = FakeBinaryView(functions=functions)
     _, find = get_tool("rex_constant_find")
-    result = find(_call(view), value=1, limit=100000)
+    result = find(_call(view), value=1, limit=tools._MAX_LIMIT)
     assert len(result["functions"]) == tools._MAX_LIMIT
     assert result["truncated"] is True
     assert result["functions"][0]["name"].endswith("chars truncated]")
@@ -424,6 +465,24 @@ def test_hlil_grep_limits_and_errors() -> None:
     with pytest.raises(FakeToolError) as exc:
         grep(_call(view), "(")
     assert exc.value.code == "invalid_regex"
+    # Out-of-range sizes are rejected with the mcp layer's argument-error convention.
+    for kwargs, message in (
+        ({"limit": -1}, "Invalid integer parameter 'limit': Must be at least 0"),
+        (
+            {"limit": tools._MAX_HLIL_GREP_LIMIT + 1},
+            f"Invalid integer parameter 'limit': Must be at most {tools._MAX_HLIL_GREP_LIMIT}",
+        ),
+        ({"max_functions": -1}, "Invalid integer parameter 'max_functions': Must be at least 0"),
+        (
+            {"max_functions": tools._MAX_HLIL_GREP_FUNCTIONS + 1},
+            "Invalid integer parameter 'max_functions': Must be at most "
+            f"{tools._MAX_HLIL_GREP_FUNCTIONS}",
+        ),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            grep(_call(view), ".", **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
 
 
 def test_hlil_grep_caps_limit_and_max_functions() -> None:
@@ -438,7 +497,13 @@ def test_hlil_grep_caps_limit_and_max_functions() -> None:
     ]
     view = FakeBinaryView(functions=matching)
     _, grep = get_tool("rex_hlil_grep")
-    result = grep(_call(view), ".", limit=100000, max_functions=100000)
+    # Exactly at both caps the values are honored, not normalized.
+    result = grep(
+        _call(view),
+        ".",
+        limit=tools._MAX_HLIL_GREP_LIMIT,
+        max_functions=tools._MAX_HLIL_GREP_FUNCTIONS,
+    )
     assert len(result["functions"]) == tools._MAX_HLIL_GREP_LIMIT
     assert result["truncated"] is True
     assert result["functions"][0]["name"].endswith("chars truncated]")
@@ -453,7 +518,12 @@ def test_hlil_grep_caps_limit_and_max_functions() -> None:
         for index in range(tools._MAX_HLIL_GREP_FUNCTIONS + 1)
     ]
     inert_view = FakeBinaryView(functions=inert)
-    scanned_result = grep(_call(inert_view), "zzz", limit=100000, max_functions=100000)
+    scanned_result = grep(
+        _call(inert_view),
+        "zzz",
+        limit=tools._MAX_HLIL_GREP_LIMIT,
+        max_functions=tools._MAX_HLIL_GREP_FUNCTIONS,
+    )
     assert scanned_result["scanned"] == tools._MAX_HLIL_GREP_FUNCTIONS
     assert scanned_result["truncated"] is True
 
@@ -484,8 +554,8 @@ def test_string_read_at_truncates_and_caps_max_chars() -> None:
     assert result["type"] == "Utf16String"
     assert result["truncated"] is True
     assert len(result["value"]) == 512 + len("... [4488 chars truncated]")
-    # max_chars can only lower the cap, never raise it past _MAX_STRING_READ_CHARS.
-    capped = read(_call(view), 0x1100, max_chars=100000000)
+    # Exactly at the cap the value is honored, never raised past _MAX_STRING_READ_CHARS.
+    capped = read(_call(view), 0x1100, max_chars=tools._MAX_STRING_READ_CHARS)
     assert capped["truncated"] is True
     assert len(capped["value"]) == tools._MAX_STRING_READ_CHARS + len("... [904 chars truncated]")
     short = FakeBinaryView(strings=[FakeStringReference("hi", 0x1100)])
@@ -636,8 +706,17 @@ def test_call_paths_reports_truncation_and_caps_depth() -> None:
     for index in range(19):
         chain[index].callers = [chain[index + 1]]
     chain_view = FakeBinaryView(functions=chain)
-    # max_depth=100 would reach the 20-deep target unclamped; the cap keeps it unreachable.
-    assert paths(_call(chain_view), 0x1000, 0x1000 + 19 * 0x10, max_depth=100)["reachable"] is False
+    chain_start, chain_end = 0x1000, 0x1000 + 19 * 0x10
+    # max_depth exactly at the cap is accepted, and the cap keeps the 20-deep target
+    # unreachable; one past the cap is rejected instead of clamped down.
+    deep = paths(_call(chain_view), chain_start, chain_end, max_depth=tools._MAX_CALL_PATH_DEPTH)
+    assert deep["reachable"] is False
+    with pytest.raises(FakeToolError) as exc:
+        paths(_call(chain_view), chain_start, chain_end, max_depth=tools._MAX_CALL_PATH_DEPTH + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'max_depth': Must be at most {tools._MAX_CALL_PATH_DEPTH}"
+    )
 
 
 def test_eval_python_executes_code() -> None:
@@ -783,7 +862,7 @@ def test_tag_list_caps_limit_and_truncates_data() -> None:
     for index in range(600):
         view.add_tag(0x2000 + index, "Finding", f"n{index}")
     _, tag_list = get_tool("rex_tag_list")
-    result = tag_list(_call(view), limit=100000)
+    result = tag_list(_call(view), limit=tools._MAX_LIMIT)
     assert result["total"] == 601
     assert len(result["tags"]) == tools._MAX_LIMIT
     assert result["truncated"] is True
@@ -792,40 +871,66 @@ def test_tag_list_caps_limit_and_truncates_data() -> None:
     assert result["tags"][1]["data_truncated"] is False
 
 
-def test_tag_list_clamps_negative_limit() -> None:
+def test_tag_list_rejects_out_of_range_limit() -> None:
     view = FakeBinaryView()
     view.add_tag(0x1000, "Finding", "a")
     view.add_tag(0x1100, "Finding", "b")
     _, tag_list = get_tool("rex_tag_list")
-    # A negative limit must behave like 0, not like Python's negative slicing.
-    result = tag_list(_call(view), limit=-1)
-    assert result["tags"] == []
-    assert result["total"] == 2
-    assert result["truncated"] is True
+    # A negative limit is invalid on its face: rejected, never normalized to 0.
+    for limit in (-1, -100):
+        with pytest.raises(FakeToolError) as exc:
+            tag_list(_call(view), limit=limit)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    with pytest.raises(FakeToolError) as exc:
+        tag_list(_call(view), limit=tools._MAX_LIMIT + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+    )
     # limit=0 pages nothing out; unlike the scan tools, "total" stays the true total.
     assert tag_list(_call(view), limit=0) == {"total": 2, "truncated": True, "tags": []}
 
 
-def test_string_search_clamps_negative_offset() -> None:
+def test_string_search_rejects_negative_offset() -> None:
     view = FakeBinaryView(
         strings=[FakeStringReference("alpha", 0x100), FakeStringReference("alphabeta", 0x120)]
     )
     _, search = get_tool("rex_string_search")
-    result = search(_call(view), pattern="alpha", limit=1, offset=-1)
-    assert result["total"] == 2
-    assert result["truncated"] is True
-    assert [item["value"] for item in result["strings"]] == ["alpha"]
+    with pytest.raises(FakeToolError) as exc:
+        search(_call(view), pattern="alpha", limit=1, offset=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'offset': Must be at least 0"
+    # Nothing ran: the rejection happens before the scan.
+    assert search(_call(view), pattern="alpha", limit=1, offset=0)["total"] == 2
 
 
-def test_data_find_clamps_negative_offset() -> None:
+def test_data_find_rejects_negative_offset() -> None:
     view = FakeBinaryView(
         segments=[FakeSegment(0x1000, 8)], memory={0x1000: b"\xeb\x0e\xeb\x0e\xff\xff\xff\xff"}
     )
     _, find = get_tool("rex_data_find")
-    result = find(_call(view), pattern="eb0e", limit=1, offset=-1)
-    assert result["total"] == 2
-    assert result["truncated"] is True
-    assert result["matches"] == ["0x1000"]
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), pattern="eb0e", limit=1, offset=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'offset': Must be at least 0"
+    # Nothing ran: the rejection happens before any segment is read.
+    assert find(_call(view), pattern="eb0e", limit=1, offset=0)["total"] == 2
+
+
+def test_data_find_rejects_out_of_range_limit() -> None:
+    view = FakeBinaryView(segments=[FakeSegment(0x1000, 8)], memory={0x1000: b"\x90" * 8})
+    _, find = get_tool("rex_data_find")
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), pattern="90", limit=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), pattern="90", limit=tools._MAX_LIMIT + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+    )
 
 
 def test_data_find_rejects_oversized_pattern() -> None:
@@ -840,17 +945,25 @@ def test_data_find_rejects_oversized_pattern() -> None:
     assert find(_call(view), pattern=boundary)["total"] == 0
 
 
-def test_string_read_at_clamps_negative_max_chars() -> None:
+def test_string_read_at_rejects_out_of_range_max_chars() -> None:
     view = FakeBinaryView(strings=[FakeStringReference("hello", 0x1100)])
     _, read = get_tool("rex_string_read_at")
-    # max_chars clamps to 1 from below: exactly one character plus the truncation suffix.
-    assert read(_call(view), 0x1100, max_chars=-5) == {
-        "address": "0x1100",
-        "length": 5,
-        "type": "AsciiString",
-        "value": "h... [4 chars truncated]",
-        "truncated": True,
-    }
+    # max_chars below 1 is invalid on its face: rejected, never clamped to 1.
+    for max_chars in (-5, 0):
+        with pytest.raises(FakeToolError) as exc:
+            read(_call(view), 0x1100, max_chars=max_chars)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == "Invalid integer parameter 'max_chars': Must be at least 1"
+    with pytest.raises(FakeToolError) as exc:
+        read(_call(view), 0x1100, max_chars=tools._MAX_STRING_READ_CHARS + 1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'max_chars': Must be at most {tools._MAX_STRING_READ_CHARS}"
+    )
+    # Both bounds are inclusive: exactly 1 and exactly the cap are accepted.
+    at_minimum = read(_call(view), 0x1100, max_chars=1)
+    assert at_minimum["value"] == "h... [4 chars truncated]"
+    assert at_minimum["truncated"] is True
 
 
 def test_call_paths_reports_one_path_per_intermediate_and_sorts_neighbors() -> None:
@@ -905,7 +1018,7 @@ def test_call_paths_reports_one_path_per_intermediate_and_sorts_neighbors() -> N
     ]
 
 
-def test_call_paths_caps_paths_per_node_and_clamps_search_bounds() -> None:
+def test_call_paths_caps_paths_per_node() -> None:
     main = FakeFunction("main", 0x1100, 0x1200)
     handler = FakeFunction("handler", 0x2000, 0x2100)
     sink = FakeFunction("sink", 0x3000, 0x3100)
@@ -918,9 +1031,35 @@ def test_call_paths_caps_paths_per_node_and_clamps_search_bounds() -> None:
     result = paths(_call(view), 0x1100, 0x3000, max_paths=2)
     assert len(result["paths"]) == 2
     assert result["truncated"] is True
-    # max_paths/max_depth below 1 behave like the ClampTo minimum of 1, not like "off".
-    assert paths(_call(view), 0x1100, 0x3000, max_paths=-1)["reachable"] is True
-    assert paths(_call(view), 0x1100, 0x2000, max_depth=0)["reachable"] is True
+
+
+def test_call_paths_rejects_out_of_range_bounds() -> None:
+    # max_paths/max_depth below 1 or above their caps are rejected, not normalized:
+    # each bound is invalid on its face and both bounds are inclusive.
+    view = _view_with_functions()
+    _, paths = get_tool("rex_call_paths")
+    for kwargs, message in (
+        ({"max_paths": 0}, "Invalid integer parameter 'max_paths': Must be at least 1"),
+        ({"max_paths": -1}, "Invalid integer parameter 'max_paths': Must be at least 1"),
+        (
+            {"max_paths": tools._MAX_CALL_PATHS + 1},
+            f"Invalid integer parameter 'max_paths': Must be at most {tools._MAX_CALL_PATHS}",
+        ),
+        ({"max_depth": 0}, "Invalid integer parameter 'max_depth': Must be at least 1"),
+        (
+            {"max_depth": tools._MAX_CALL_PATH_DEPTH + 1},
+            f"Invalid integer parameter 'max_depth': Must be at most {tools._MAX_CALL_PATH_DEPTH}",
+        ),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            paths(_call(view), 0x1100, 0x1100, **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+    # Exactly at both caps (and at the minimum of 1) the search still runs.
+    at_cap_paths = paths(_call(view), 0x1100, 0x1100, max_paths=tools._MAX_CALL_PATHS)
+    assert at_cap_paths["reachable"] is True
+    at_cap_depth = paths(_call(view), 0x1100, 0x1100, max_depth=tools._MAX_CALL_PATH_DEPTH)
+    assert at_cap_depth["reachable"] is True
 
 
 def test_tag_set_caps_new_tag_type_name() -> None:

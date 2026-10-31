@@ -24,8 +24,10 @@ from binja_plugin.hexpattern import HexPatternError, compile_hex_pattern
 
 _READ_CHUNK = 4 * 1024 * 1024
 _MAX_CHARS = 512
-# Hard caps for list sizes and echoed strings: every user-supplied limit is clamped to
-# these in the tool bodies so the caps hold even when handlers are invoked directly.
+# Hard caps for list sizes and echoed strings: user-supplied size parameters are
+# range-checked against these in the tool bodies — matching the schema-side
+# Minimum/Maximum annotations — so out-of-range values are rejected even when handlers
+# are invoked directly.
 _MAX_LIMIT = 500
 _MAX_HLIL_GREP_LIMIT = 200
 _MAX_HLIL_GREP_FUNCTIONS = 5000
@@ -45,6 +47,24 @@ _MAX_PATTERN_CHARS = 8192
 _METADATA_PREFIX = "rex/"
 _TAG_ICON = "\u25c6"
 _STRING_TYPES = Literal["AsciiString", "Utf16String", "Utf32String", "Utf8String"]
+
+
+def _validate_range(name: str, value: int, minimum: int, maximum: int | None = None) -> int:
+    """Reject an out-of-range integer argument instead of silently normalizing it.
+
+    The code and message follow the bundled mcp layer's own argument-error convention, and
+    the schema-side ``Minimum``/``Maximum`` annotations reject the same values on the real
+    server; this body-side check keeps direct handler invocation identical.
+    """
+    if value < minimum:
+        raise mcp.ToolError(
+            "invalid_params", f"Invalid integer parameter '{name}': Must be at least {minimum}"
+        )
+    if maximum is not None and value > maximum:
+        raise mcp.ToolError(
+            "invalid_params", f"Invalid integer parameter '{name}': Must be at most {maximum}"
+        )
+    return value
 
 
 def _truncate_with_flag(value: str, limit: int = _MAX_CHARS) -> tuple[str, bool]:
@@ -113,20 +133,20 @@ def rex_call_paths(
     from_addr: mcp.Address,
     to_addr: mcp.Address,
     direction: Literal["callers", "callees"] = "callers",
-    max_depth: Annotated[int, mcp.ClampTo(1, _MAX_CALL_PATH_DEPTH)] = 8,
-    max_paths: Annotated[int, mcp.ClampTo(1, _MAX_CALL_PATHS)] = 5,
+    max_depth: Annotated[int, mcp.Minimum(1), mcp.Maximum(_MAX_CALL_PATH_DEPTH)] = 8,
+    max_paths: Annotated[int, mcp.Minimum(1), mcp.Maximum(_MAX_CALL_PATHS)] = 5,
 ) -> dict[str, object]:
     """Bounded breadth-first search for call paths between two functions.
 
     :param from_addr: Address inside the starting function.
     :param to_addr: Address inside the target function.
     :param direction: Walk "callers" edges (what reaches the target) or "callees" edges.
-    :param max_depth: Maximum number of edges to walk from the starting function.
-    :param max_paths: Maximum number of paths to return.
+    :param max_depth: Maximum number of edges to walk from the starting function (1 to 16).
+    :param max_paths: Maximum number of paths to return (1 to 50).
     """
     bv = call.binary_view
-    max_depth = max(min(max_depth, _MAX_CALL_PATH_DEPTH), 1)
-    max_paths = max(min(max_paths, _MAX_CALL_PATHS), 1)
+    max_depth = _validate_range("max_depth", max_depth, 1, _MAX_CALL_PATH_DEPTH)
+    max_paths = _validate_range("max_paths", max_paths, 1, _MAX_CALL_PATHS)
     source = _require_function(bv, from_addr)
     target = _require_function(bv, to_addr)
     paths: list[list[dict[str, object]]] = []
@@ -176,7 +196,7 @@ def rex_constant_find(
     call: mcp.ToolCall,
     value: int,
     function_filter: str = "",
-    limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
+    limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_LIMIT)] = 50,
 ) -> dict[str, object]:
     """Find functions whose MLIL references an immediate constant value.
 
@@ -184,10 +204,10 @@ def rex_constant_find(
 
     :param value: Immediate value to search for, e.g. 31337 or 65534.
     :param function_filter: Case-insensitive regular expression matched against function names.
-    :param limit: Maximum number of matching functions to return.
+    :param limit: Maximum number of matching functions to return (0 to 500).
     """
     bv = call.binary_view
-    limit = max(min(limit, _MAX_LIMIT), 0)
+    limit = _validate_range("limit", limit, 0, _MAX_LIMIT)
     name_matcher = _name_filter(function_filter)
     functions: list[dict[str, object]] = []
     truncated = False
@@ -222,19 +242,19 @@ def rex_data_find(
     call: mcp.ToolCall,
     pattern: str,
     section: str | None = None,
-    limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
-    offset: int = 0,
+    limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_LIMIT)] = 50,
+    offset: Annotated[int, mcp.Minimum(0)] = 0,
 ) -> dict[str, object]:
     """Find all occurrences of a hex byte pattern in mapped memory.
 
     :param pattern: Hex byte pattern, e.g. "48 8b ?? 05"; "??" matches any single byte.
     :param section: Only search within this section.
-    :param limit: Maximum number of matches to return.
-    :param offset: Number of matches to skip before collecting results.
+    :param limit: Maximum number of matches to return (0 to 500).
+    :param offset: Number of matches to skip before collecting results (>= 0).
     """
     bv = call.binary_view
-    limit = max(min(limit, _MAX_LIMIT), 0)
-    offset = max(offset, 0)
+    limit = _validate_range("limit", limit, 0, _MAX_LIMIT)
+    offset = _validate_range("offset", offset, 0)
     if len(pattern) > _MAX_PATTERN_CHARS:
         raise mcp.ToolError("pattern_too_large", f"pattern exceeds {_MAX_PATTERN_CHARS} characters")
     try:
@@ -370,8 +390,8 @@ def rex_hlil_grep(
     call: mcp.ToolCall,
     regex: str,
     function_filter: str = "",
-    limit: Annotated[int, mcp.ClampTo(0, _MAX_HLIL_GREP_LIMIT)] = 20,
-    max_functions: Annotated[int, mcp.ClampTo(0, _MAX_HLIL_GREP_FUNCTIONS)] = 2000,
+    limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_LIMIT)] = 20,
+    max_functions: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_FUNCTIONS)] = 2000,
 ) -> dict[str, object]:
     """Search rendered HLIL text across functions with a regular expression.
 
@@ -381,12 +401,12 @@ def rex_hlil_grep(
 
     :param regex: Regular expression applied to every rendered HLIL line.
     :param function_filter: Case-insensitive regular expression matched against function names.
-    :param limit: Maximum number of matching functions to return.
-    :param max_functions: Maximum number of functions to scan before stopping.
+    :param limit: Maximum number of matching functions to return (0 to 200).
+    :param max_functions: Maximum number of functions to scan before stopping (0 to 5000).
     """
     bv = call.binary_view
-    limit = max(min(limit, _MAX_HLIL_GREP_LIMIT), 0)
-    max_functions = max(min(max_functions, _MAX_HLIL_GREP_FUNCTIONS), 0)
+    limit = _validate_range("limit", limit, 0, _MAX_HLIL_GREP_LIMIT)
+    max_functions = _validate_range("max_functions", max_functions, 0, _MAX_HLIL_GREP_FUNCTIONS)
     matcher = _compile_user_regex(regex)
     name_matcher = _name_filter(function_filter)
     matches: list[dict[str, object]] = []
@@ -485,17 +505,17 @@ def rex_memory_write(call: mcp.ToolCall, addr: mcp.Address, hex_data: str) -> di
 def rex_string_read_at(
     call: mcp.ToolCall,
     addr: mcp.Address,
-    max_chars: Annotated[int, mcp.ClampTo(1, _MAX_STRING_READ_CHARS)] = _MAX_CHARS,
+    max_chars: Annotated[int, mcp.Minimum(1), mcp.Maximum(_MAX_STRING_READ_CHARS)] = _MAX_CHARS,
 ) -> dict[str, object]:
     """Read the detected string at an address.
 
     :param addr: Address of the string.
-    :param max_chars: Truncate long string values to this many characters.
+    :param max_chars: Truncate long string values to this many characters (1 to 4096).
     """
+    max_chars = _validate_range("max_chars", max_chars, 1, _MAX_STRING_READ_CHARS)
     string = call.binary_view.get_string_at(addr)
     if string is None:
         raise mcp.ToolError("no_string", f"no detected string at {addr:#x}")
-    max_chars = max(min(max_chars, _MAX_STRING_READ_CHARS), 1)
     value, truncated = _truncate_with_flag(string.value, max_chars)
     return {
         "address": hex(string.start),
@@ -514,8 +534,8 @@ def rex_string_search(
     ignore_case: bool = False,
     section: str | None = None,
     string_type: _STRING_TYPES | None = None,
-    limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
-    offset: int = 0,
+    limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_LIMIT)] = 50,
+    offset: Annotated[int, mcp.Minimum(0)] = 0,
 ) -> dict[str, object]:
     """Search the binary's detected strings by substring or regular expression.
 
@@ -527,12 +547,12 @@ def rex_string_search(
     :param ignore_case: Match case-insensitively.
     :param section: Only include strings within this section.
     :param string_type: Only include strings of this type.
-    :param limit: Maximum number of strings to return.
-    :param offset: Number of matching strings to skip before collecting results.
+    :param limit: Maximum number of strings to return (0 to 500).
+    :param offset: Number of matching strings to skip before collecting results (>= 0).
     """
     bv = call.binary_view
-    limit = max(min(limit, _MAX_LIMIT), 0)
-    offset = max(offset, 0)
+    limit = _validate_range("limit", limit, 0, _MAX_LIMIT)
+    offset = _validate_range("offset", offset, 0)
     matcher = _compile_user_regex(pattern, ignore_case=ignore_case) if regex else None
     bounds = _resolve_section(bv, section) if section is not None else None
     total = 0
@@ -570,13 +590,13 @@ def rex_string_search(
 
 @mcp.tool(read_only=True)
 def rex_tag_list(
-    call: mcp.ToolCall, limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 100
+    call: mcp.ToolCall, limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_LIMIT)] = 100
 ) -> dict[str, object]:
     """List the tags set on the binary view.
 
-    :param limit: Maximum number of tags to return.
+    :param limit: Maximum number of tags to return (0 to 500).
     """
-    limit = max(min(limit, _MAX_LIMIT), 0)
+    limit = _validate_range("limit", limit, 0, _MAX_LIMIT)
     tags = []
     for address, tag in call.binary_view.get_tags():
         data, data_truncated = _truncate_with_flag(tag.data)

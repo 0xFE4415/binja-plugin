@@ -3,15 +3,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pytest
 from helpers import (
     FakeBinaryView,
     FakeFunction,
     FakeSegment,
     FakeStringReference,
     FakeToolCall,
+    FakeToolError,
     get_tool,
 )
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from binja_plugin import tools
@@ -51,11 +53,12 @@ def test_matches_agree_with_naive_search(tokens: list[str], blob: bytes) -> None
 
 # --- rex_string_search pagination -------------------------------------------------
 #
-# The full match list (one unclamped scan) is the reference; every page must be the
+# The full match list (one unbounded scan) is the reference; every page must be the
 # exact slice of it. The scan stops at the first match past the window, so a page's
 # "total" is min(true_total, offset+limit+1) and "truncated" is exactly "the window
 # ended before the matches did". Nothing here recomputes matching logic: it only pins
-# window arithmetic against the tool's own untruncated scan.
+# window arithmetic against the tool's own untruncated scan. Out-of-range pagination
+# input is covered by the rejection properties below.
 
 
 def _string_view(strings: list[str]) -> tuple[FakeToolCall, Any]:
@@ -77,25 +80,26 @@ def _check_page(
     limit: int,
     items_key: str = "strings",
 ) -> None:
-    clamped_offset = max(offset, 0)
-    clamped_limit = max(min(limit, tools._MAX_LIMIT), 0)
-    assert page[items_key] == everything[clamped_offset : clamped_offset + clamped_limit]
+    # Callers pass only in-range values: rejection of anything else is its own contract.
+    assert offset >= 0
+    assert 0 <= limit <= tools._MAX_LIMIT
+    assert page[items_key] == everything[offset : offset + limit]
     assert len(page[items_key]) <= tools._MAX_LIMIT
-    assert page["total"] == min(true_total, clamped_offset + clamped_limit + 1)
-    assert page["truncated"] is (true_total > clamped_offset + clamped_limit)
+    assert page["total"] == min(true_total, offset + limit + 1)
+    assert page["truncated"] is (true_total > offset + limit)
 
 
 @given(
     strings=st.lists(st.text(max_size=8), max_size=10),
     pattern=st.text(min_size=1, max_size=3),
-    limit=st.integers(min_value=-3, max_value=2**63),
-    offset=st.integers(min_value=-3, max_value=2**63),
+    limit=st.integers(min_value=0, max_value=tools._MAX_LIMIT),
+    offset=st.integers(min_value=0, max_value=2**63),
 )
 def test_string_search_pages_tile_the_full_result(
     strings: list[str], pattern: str, limit: int, offset: int
 ) -> None:
     call, search = _string_view(strings)
-    full = search(call, pattern=pattern, limit=500)
+    full = search(call, pattern=pattern, limit=tools._MAX_LIMIT)
     assert full["truncated"] is False
     everything = full["strings"]
     true_total = full["total"]
@@ -118,7 +122,7 @@ def test_string_search_pages_tile_the_full_result(
             2,
         )
 
-    # Arbitrary (adversarial) limit/offset values clamp before use.
+    # An arbitrary adversarial (but valid) offset pages the exact expected slice.
     _check_page(
         search(call, pattern=pattern, limit=limit, offset=offset),
         everything,
@@ -128,14 +132,44 @@ def test_string_search_pages_tile_the_full_result(
     )
 
 
+# --- out-of-range pagination input is rejected, never normalized --------------------
+#
+# Adversarial integers: any limit outside [0, _MAX_LIMIT] or any negative offset must
+# raise the mcp layer's argument-error convention with the exact per-parameter message,
+# regardless of the other parameter's validity.
+
+
+@given(
+    strings=st.lists(st.text(max_size=8), max_size=5),
+    limit=st.integers(min_value=-(2**63), max_value=2**63),
+    offset=st.integers(min_value=-(2**63), max_value=2**63),
+)
+def test_string_search_rejects_out_of_range_pagination(
+    strings: list[str], limit: int, offset: int
+) -> None:
+    assume(not (0 <= limit <= tools._MAX_LIMIT and offset >= 0))
+    call, search = _string_view(strings)
+    with pytest.raises(FakeToolError) as exc:
+        search(call, pattern="a", limit=limit, offset=offset)
+    assert exc.value.code == "invalid_params"
+    if limit < 0:
+        assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    elif limit > tools._MAX_LIMIT:
+        assert exc.value.message == (
+            f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+        )
+    else:
+        assert exc.value.message == "Invalid integer parameter 'offset': Must be at least 0"
+
+
 # --- rex_data_find pagination -------------------------------------------------------
 
 
 @given(
     blob=st.lists(st.sampled_from(_BLOB_BYTES), max_size=48).map(bytes),
     tokens=st.lists(st.sampled_from(_TOKENS), min_size=1, max_size=3),
-    limit=st.integers(min_value=-3, max_value=2**63),
-    offset=st.integers(min_value=-3, max_value=2**63),
+    limit=st.integers(min_value=0, max_value=tools._MAX_LIMIT),
+    offset=st.integers(min_value=0, max_value=2**63),
 )
 def test_data_find_pages_tile_the_full_result(
     blob: bytes, tokens: list[str], limit: int, offset: int
@@ -147,7 +181,7 @@ def test_data_find_pages_tile_the_full_result(
     )
     _, find = get_tool("rex_data_find")
     call = FakeToolCall(view)
-    full = find(call, pattern=pattern, limit=500)
+    full = find(call, pattern=pattern, limit=tools._MAX_LIMIT)
     assert full["truncated"] is False
     everything = full["matches"]
     true_total = full["total"]
@@ -178,23 +212,47 @@ def test_data_find_pages_tile_the_full_result(
     )
 
 
-# --- rex_tag_list clamping ----------------------------------------------------------
+@given(
+    blob=st.lists(st.sampled_from(_BLOB_BYTES), max_size=8).map(bytes),
+    limit=st.integers(min_value=-(2**63), max_value=2**63),
+    offset=st.integers(min_value=-(2**63), max_value=2**63),
+)
+def test_data_find_rejects_out_of_range_pagination(blob: bytes, limit: int, offset: int) -> None:
+    assume(not (0 <= limit <= tools._MAX_LIMIT and offset >= 0))
+    view = FakeBinaryView(
+        segments=[FakeSegment(0x2000, max(len(blob), 1))],
+        memory={0x2000: blob} if blob else {},
+    )
+    _, find = get_tool("rex_data_find")
+    with pytest.raises(FakeToolError) as exc:
+        find(FakeToolCall(view), pattern="00", limit=limit, offset=offset)
+    assert exc.value.code == "invalid_params"
+    if limit < 0:
+        assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    elif limit > tools._MAX_LIMIT:
+        assert exc.value.message == (
+            f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+        )
+    else:
+        assert exc.value.message == "Invalid integer parameter 'offset': Must be at least 0"
+
+
+# --- rex_tag_list paging -------------------------------------------------------------
 #
 # tag_list reports the true total (it builds the whole list before slicing), slices
-# tags[:clamped_limit], and flags truncated exactly when tags exist past the page.
+# tags[:limit], and flags truncated exactly when tags exist past the page.
 
 
 @given(
     tags=st.lists(st.tuples(st.integers(0, 2**63), st.text(max_size=600)), max_size=10),
-    limit=st.integers(min_value=-3, max_value=2**63),
+    limit=st.integers(min_value=0, max_value=tools._MAX_LIMIT),
 )
-def test_tag_list_clamps_arbitrary_limits(tags: list[tuple[int, str]], limit: int) -> None:
+def test_tag_list_pages_arbitrary_limits(tags: list[tuple[int, str]], limit: int) -> None:
     view = FakeBinaryView()
     for address, data in tags:
         view.add_tag(address, "Finding", data)
     _, tag_list = get_tool("rex_tag_list")
     result = tag_list(FakeToolCall(view), limit=limit)
-    clamped = max(min(limit, tools._MAX_LIMIT), 0)
     expected = [
         {
             "address": hex(address),
@@ -207,16 +265,37 @@ def test_tag_list_clamps_arbitrary_limits(tags: list[tuple[int, str]], limit: in
         for address, data in tags
     ]
     assert result["total"] == len(tags)
-    assert result["truncated"] is (len(tags) > clamped)
-    assert result["tags"] == expected[:clamped]
+    assert result["truncated"] is (len(tags) > limit)
+    assert result["tags"] == expected[:limit]
+
+
+@given(
+    tags=st.lists(st.tuples(st.integers(0, 2**63), st.text(max_size=8)), max_size=5),
+    limit=st.integers(min_value=-(2**63), max_value=2**63),
+)
+def test_tag_list_rejects_out_of_range_limits(tags: list[tuple[int, str]], limit: int) -> None:
+    assume(not 0 <= limit <= tools._MAX_LIMIT)
+    view = FakeBinaryView()
+    for address, data in tags:
+        view.add_tag(address, "Finding", data)
+    _, tag_list = get_tool("rex_tag_list")
+    with pytest.raises(FakeToolError) as exc:
+        tag_list(FakeToolCall(view), limit=limit)
+    assert exc.value.code == "invalid_params"
+    if limit < 0:
+        assert exc.value.message == "Invalid integer parameter 'limit': Must be at least 0"
+    else:
+        assert exc.value.message == (
+            f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}"
+        )
 
 
 # --- rex_call_paths on random call graphs -------------------------------------------
 #
 # Invariants over generated graphs: paths are real edges of the graph, start at the
-# from-function, end at the to-function, never exceed the clamped depth, are unique
-# and loop-free, reachable is exactly "target within clamped depth" (verified by an
-# independent Floyd-Warshall oracle), and truncated is exactly "the path cap was hit".
+# from-function, end at the to-function, never exceed the requested depth, are unique
+# and loop-free, reachable is exactly "target within the requested depth" (verified by
+# an independent Floyd-Warshall oracle), and truncated is exactly "the path cap was hit".
 
 
 _NODES = 6
@@ -258,8 +337,8 @@ def _min_distances(adjacency: list[set[int]], direction: str) -> list[list[int]]
     from_index=st.integers(0, _NODES - 1),
     to_index=st.integers(0, _NODES - 1),
     direction=st.sampled_from(["callers", "callees"]),
-    max_depth=st.integers(min_value=-2, max_value=2**63),
-    max_paths=st.integers(min_value=-2, max_value=2**63),
+    max_depth=st.integers(min_value=1, max_value=tools._MAX_CALL_PATH_DEPTH),
+    max_paths=st.integers(min_value=1, max_value=tools._MAX_CALL_PATHS),
 )
 def test_call_paths_reports_real_edges_within_the_depth_cap(
     edges: list[tuple[int, int]],
@@ -279,8 +358,8 @@ def test_call_paths_reports_real_edges_within_the_depth_cap(
         max_depth=max_depth,
         max_paths=max_paths,
     )
-    depth_cap = max(min(max_depth, tools._MAX_CALL_PATH_DEPTH), 1)
-    path_cap = max(min(max_paths, tools._MAX_CALL_PATHS), 1)
+    depth_cap = max_depth
+    path_cap = max_paths
 
     if from_index == to_index:
         assert result == {
@@ -314,6 +393,41 @@ def test_call_paths_reports_real_edges_within_the_depth_cap(
 
     oracle = _min_distances(adjacency, direction)
     assert result["reachable"] is (oracle[from_index][to_index] <= depth_cap)
+
+
+@given(
+    max_depth=st.integers(min_value=-(2**63), max_value=2**63),
+    max_paths=st.integers(min_value=-(2**63), max_value=2**63),
+)
+def test_call_paths_rejects_out_of_range_bounds(max_depth: int, max_paths: int) -> None:
+    assume(
+        not (
+            1 <= max_depth <= tools._MAX_CALL_PATH_DEPTH and 1 <= max_paths <= tools._MAX_CALL_PATHS
+        )
+    )
+    functions, _ = _graph([])
+    _, paths_tool = get_tool("rex_call_paths")
+    with pytest.raises(FakeToolError) as exc:
+        paths_tool(
+            FakeToolCall(FakeBinaryView(functions=functions)),
+            _STARTS[0] + 4,
+            _STARTS[0] + 4,
+            max_depth=max_depth,
+            max_paths=max_paths,
+        )
+    assert exc.value.code == "invalid_params"
+    if max_depth < 1:
+        assert exc.value.message == "Invalid integer parameter 'max_depth': Must be at least 1"
+    elif max_depth > tools._MAX_CALL_PATH_DEPTH:
+        assert exc.value.message == (
+            f"Invalid integer parameter 'max_depth': Must be at most {tools._MAX_CALL_PATH_DEPTH}"
+        )
+    elif max_paths < 1:
+        assert exc.value.message == "Invalid integer parameter 'max_paths': Must be at least 1"
+    else:
+        assert exc.value.message == (
+            f"Invalid integer parameter 'max_paths': Must be at most {tools._MAX_CALL_PATHS}"
+        )
 
 
 # --- rex_string_search regex/ignore_case composition --------------------------------
