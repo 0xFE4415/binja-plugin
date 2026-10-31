@@ -43,6 +43,14 @@ clients that already connected must reconnect to see the registered `rex_*` tool
 Search tools return `total`, `truncated`, and paginated results via `limit`/`offset` so
 agents never need to page through unbounded listings.
 
+## Known limits
+
+- `rex_string_search` and `rex_hlil_grep` compile model-supplied regular expressions with
+  Python's `re`, which has no match timeout. A pattern prone to catastrophic backtracking
+  (e.g. nested quantifiers like `(a+)+$`) can stall the tool invocation indefinitely; the
+  MCP server processes invocations serially while it runs. Prefer substring mode
+  (`regex=false`) when the input is not trusted, and keep regexes simple.
+
 ## Development
 
 The project uses [nox](https://nox.thea.codes/) with `uv` as the default venv backend:

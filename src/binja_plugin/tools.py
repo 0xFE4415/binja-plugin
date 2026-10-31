@@ -34,8 +34,13 @@ _MAX_FUNCTION_ENTRIES = 50
 _MAX_EVAL_STDOUT_CHARS = 65536
 _MAX_EVAL_RESULT_CHARS = 16384
 _MAX_KV_VALUE_CHARS = 65536
+_MAX_KV_KEY_CHARS = 128
 _MAX_TAG_DATA_CHARS = 65536
+_MAX_TAG_TYPE_CHARS = 64
 _MAX_STRING_READ_CHARS = 4096
+# Raw pattern-string cap for rex_data_find: bounds the regex compile and the per-chunk
+# read inflation (read_size grows with the pattern length) before any of that happens.
+_MAX_PATTERN_CHARS = 8192
 _METADATA_PREFIX = "rex/"
 _TAG_ICON = "\u25c6"
 _STRING_TYPES = Literal["AsciiString", "Utf16String", "Utf32String", "Utf8String"]
@@ -117,8 +122,8 @@ def rex_call_paths(
     :param max_paths: Maximum number of paths to return.
     """
     bv = call.binary_view
-    max_depth = min(max_depth, _MAX_CALL_PATH_DEPTH)
-    max_paths = min(max_paths, _MAX_CALL_PATHS)
+    max_depth = max(min(max_depth, _MAX_CALL_PATH_DEPTH), 1)
+    max_paths = max(min(max_paths, _MAX_CALL_PATHS), 1)
     source = _require_function(bv, from_addr)
     target = _require_function(bv, to_addr)
     paths: list[list[dict[str, object]]] = []
@@ -132,6 +137,7 @@ def rex_call_paths(
     queue: deque[tuple[Function, list[Function]]] = deque([(source, [source])])
     visited = {source.start}
     explored = 0
+    hit_path_cap = False
     while queue and len(paths) < max_paths:
         function, path = queue.popleft()
         if len(path) > max_depth:
@@ -144,10 +150,15 @@ def rex_call_paths(
         for neighbor in neighbors:
             if neighbor.start == target.start:
                 paths.append([_function_entry(item) for item in [*path, neighbor]])
+                if len(paths) >= max_paths:
+                    # One function's call sites can list the target several times; stop
+                    # appending so the result never exceeds max_paths.
+                    hit_path_cap = True
+                    break
             elif neighbor.start not in visited:
                 visited.add(neighbor.start)
                 queue.append((neighbor, [*path, neighbor]))
-    truncated = len(paths) > max_paths or (len(paths) >= max_paths and bool(queue))
+    truncated = hit_path_cap or len(paths) > max_paths or (len(paths) >= max_paths and bool(queue))
     return {"reachable": bool(paths), "paths": paths, "truncated": truncated, "explored": explored}
 
 
@@ -165,7 +176,7 @@ def rex_constant_find(
     :param limit: Maximum number of matching functions to return.
     """
     bv = call.binary_view
-    limit = min(limit, _MAX_LIMIT)
+    limit = max(min(limit, _MAX_LIMIT), 0)
     name_matcher = _name_filter(function_filter)
     functions: list[dict[str, object]] = []
     truncated = False
@@ -211,7 +222,10 @@ def rex_data_find(
     :param offset: Number of matches to skip before collecting results.
     """
     bv = call.binary_view
-    limit = min(limit, _MAX_LIMIT)
+    limit = max(min(limit, _MAX_LIMIT), 0)
+    offset = max(offset, 0)
+    if len(pattern) > _MAX_PATTERN_CHARS:
+        raise mcp.ToolError("pattern_too_large", f"pattern exceeds {_MAX_PATTERN_CHARS} characters")
     try:
         matcher, pattern_length = compile_hex_pattern(pattern)
     except HexPatternError as exc:
@@ -345,14 +359,17 @@ def rex_hlil_grep(
 ) -> dict[str, object]:
     """Search rendered HLIL text across functions with a regular expression.
 
+    Regular expressions run on Python's ``re`` with no timeout, so a pattern with
+    catastrophic backtracking can stall the scan.
+
     :param regex: Regular expression applied to every rendered HLIL line.
     :param function_filter: Case-insensitive regular expression matched against function names.
     :param limit: Maximum number of matching functions to return.
     :param max_functions: Maximum number of functions to scan before stopping.
     """
     bv = call.binary_view
-    limit = min(limit, _MAX_HLIL_GREP_LIMIT)
-    max_functions = min(max_functions, _MAX_HLIL_GREP_FUNCTIONS)
+    limit = max(min(limit, _MAX_HLIL_GREP_LIMIT), 0)
+    max_functions = max(min(max_functions, _MAX_HLIL_GREP_FUNCTIONS), 0)
     matcher = _compile_user_regex(regex)
     name_matcher = _name_filter(function_filter)
     matches: list[dict[str, object]] = []
@@ -419,6 +436,9 @@ def rex_kv_set(call: mcp.ToolCall, key: str, value: str) -> dict[str, object]:
     """
     if not key:
         raise mcp.ToolError("invalid_key", "key must not be empty")
+    if len(key) > _MAX_KV_KEY_CHARS:
+        # The key becomes part of the persistent metadata path with no core-side length bound.
+        raise mcp.ToolError("key_too_large", f"key exceeds {_MAX_KV_KEY_CHARS} characters")
     if len(value) > _MAX_KV_VALUE_CHARS:
         raise mcp.ToolError("value_too_large", f"value exceeds {_MAX_KV_VALUE_CHARS} characters")
     call.binary_view.store_metadata(_METADATA_PREFIX + key, value)
@@ -458,7 +478,8 @@ def rex_string_read_at(
     string = call.binary_view.get_string_at(addr)
     if string is None:
         raise mcp.ToolError("no_string", f"no detected string at {addr:#x}")
-    value, truncated = _truncate_with_flag(string.value, min(max_chars, _MAX_STRING_READ_CHARS))
+    max_chars = max(min(max_chars, _MAX_STRING_READ_CHARS), 1)
+    value, truncated = _truncate_with_flag(string.value, max_chars)
     return {
         "address": hex(string.start),
         "length": len(string),
@@ -481,6 +502,9 @@ def rex_string_search(
 ) -> dict[str, object]:
     """Search the binary's detected strings by substring or regular expression.
 
+    Regular expressions run on Python's ``re`` with no timeout, so a pattern with
+    catastrophic backtracking can stall the search; prefer substring mode for untrusted input.
+
     :param pattern: Substring or regular expression to match; empty matches every string.
     :param regex: Treat pattern as a regular expression instead of a substring.
     :param ignore_case: Match case-insensitively.
@@ -490,7 +514,8 @@ def rex_string_search(
     :param offset: Number of matching strings to skip before collecting results.
     """
     bv = call.binary_view
-    limit = min(limit, _MAX_LIMIT)
+    limit = max(min(limit, _MAX_LIMIT), 0)
+    offset = max(offset, 0)
     matcher = _compile_user_regex(pattern, ignore_case=ignore_case) if regex else None
     bounds = _resolve_section(bv, section) if section is not None else None
     total = 0
@@ -534,7 +559,7 @@ def rex_tag_list(
 
     :param limit: Maximum number of tags to return.
     """
-    limit = min(limit, _MAX_LIMIT)
+    limit = max(min(limit, _MAX_LIMIT), 0)
     tags = []
     for address, tag in call.binary_view.get_tags():
         data, data_truncated = _truncate_with_flag(tag.data)
@@ -566,6 +591,11 @@ def rex_tag_set(
     if tag_type not in bv.tag_types:
         if not create_missing:
             raise mcp.ToolError("tag_type_not_found", f"no tag type named '{_truncate(tag_type)}'")
+        if len(tag_type) > _MAX_TAG_TYPE_CHARS:
+            # create_tag_type persists the name in the database with no core-side length bound.
+            raise mcp.ToolError(
+                "tag_type_too_large", f"tag type name exceeds {_MAX_TAG_TYPE_CHARS} characters"
+            )
         bv.create_tag_type(tag_type, _TAG_ICON)
     bv.add_tag(addr, tag_type, data)
     data_preview, data_truncated = _truncate_with_flag(data)

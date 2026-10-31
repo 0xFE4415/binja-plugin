@@ -566,6 +566,8 @@ def test_tag_set_caps_data_and_truncates_echo() -> None:
         tag_set(_call(view), 0x4010, "T" * 1000, "x", create_missing=False)
     assert exc.value.code == "tag_type_not_found"
     assert "chars truncated]" in exc.value.message
+    # A name past the creation cap can only be echoed if the tag type already exists.
+    view.create_tag_type("F" * 1000, "\u25c6")
     result = tag_set(_call(view), 0x4010, "F" * 1000, "d" * 600)
     assert result["tag_type"].endswith("chars truncated]")
     assert result["data_truncated"] is True
@@ -604,3 +606,101 @@ def test_tag_list_caps_limit_and_truncates_data() -> None:
     assert result["tags"][0]["data_truncated"] is True
     assert result["tags"][0]["data"].endswith("chars truncated]")
     assert result["tags"][1]["data_truncated"] is False
+
+
+def test_tag_list_clamps_negative_limit() -> None:
+    view = FakeBinaryView()
+    view.add_tag(0x1000, "Finding", "a")
+    view.add_tag(0x1100, "Finding", "b")
+    _, tag_list = get_tool("rex_tag_list")
+    # A negative limit must behave like 0, not like Python's negative slicing.
+    result = tag_list(_call(view), limit=-1)
+    assert result["tags"] == []
+    assert result["total"] == 2
+    assert result["truncated"] is True
+
+
+def test_string_search_clamps_negative_offset() -> None:
+    view = FakeBinaryView(
+        strings=[FakeStringReference("alpha", 0x100), FakeStringReference("alphabeta", 0x120)]
+    )
+    _, search = get_tool("rex_string_search")
+    result = search(_call(view), pattern="alpha", limit=1, offset=-1)
+    assert result["total"] == 2
+    assert result["truncated"] is True
+    assert [item["value"] for item in result["strings"]] == ["alpha"]
+
+
+def test_data_find_clamps_negative_offset() -> None:
+    view = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 8)], memory={0x1000: b"\xeb\x0e\xeb\x0e\xff\xff\xff\xff"}
+    )
+    _, find = get_tool("rex_data_find")
+    result = find(_call(view), pattern="eb0e", limit=1, offset=-1)
+    assert result["total"] == 2
+    assert result["truncated"] is True
+    assert result["matches"] == ["0x1000"]
+
+
+def test_data_find_rejects_oversized_pattern() -> None:
+    view = FakeBinaryView(segments=[FakeSegment(0x1000, 4)], memory={0x1000: b"\x90\x90\x90\x90"})
+    _, find = get_tool("rex_data_find")
+    oversized = "90" * (tools._MAX_PATTERN_CHARS // 2 + 1)
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), pattern=oversized)
+    assert exc.value.code == "pattern_too_large"
+    # A pattern of exactly the cap is still accepted (it just cannot match 4 bytes).
+    boundary = "90" * (tools._MAX_PATTERN_CHARS // 2)
+    assert find(_call(view), pattern=boundary)["total"] == 0
+
+
+def test_string_read_at_clamps_negative_max_chars() -> None:
+    view = FakeBinaryView(strings=[FakeStringReference("hello", 0x1100)])
+    _, read = get_tool("rex_string_read_at")
+    result = read(_call(view), 0x1100, max_chars=-5)
+    assert result["truncated"] is True
+    assert result["value"].startswith("h")
+
+
+def test_call_paths_caps_paths_per_node_and_clamps_search_bounds() -> None:
+    main = FakeFunction("main", 0x1100, 0x1200)
+    handler = FakeFunction("handler", 0x2000, 0x2100)
+    sink = FakeFunction("sink", 0x3000, 0x3100)
+    main.callers = [handler]
+    # Real BinaryView call-graph properties list one entry per call site, so the target can
+    # appear several times in one neighbors list.
+    handler.callers = [sink, sink, sink]
+    view = FakeBinaryView(functions=[main, handler, sink])
+    _, paths = get_tool("rex_call_paths")
+    result = paths(_call(view), 0x1100, 0x3000, max_paths=2)
+    assert len(result["paths"]) == 2
+    assert result["truncated"] is True
+    # max_paths/max_depth below 1 behave like the ClampTo minimum of 1, not like "off".
+    assert paths(_call(view), 0x1100, 0x3000, max_paths=-1)["reachable"] is True
+    assert paths(_call(view), 0x1100, 0x2000, max_depth=0)["reachable"] is True
+
+
+def test_tag_set_caps_new_tag_type_name() -> None:
+    view = FakeBinaryView()
+    _, tag_set = get_tool("rex_tag_set")
+    with pytest.raises(FakeToolError) as exc:
+        tag_set(_call(view), 0x4010, "T" * (tools._MAX_TAG_TYPE_CHARS + 1), "x")
+    assert exc.value.code == "tag_type_too_large"
+    assert view.tag_types == {}
+    # A long name that already exists is still usable; only creation is capped.
+    view.create_tag_type("L" * 100, "\u25c6")
+    result = tag_set(_call(view), 0x4010, "L" * 100, "x")
+    assert result["tag_type"] == "L" * 100
+
+
+def test_kv_set_caps_key_length() -> None:
+    view = FakeBinaryView()
+    _, kv_set = get_tool("rex_kv_set")
+    with pytest.raises(FakeToolError) as exc:
+        kv_set(_call(view), "k" * (tools._MAX_KV_KEY_CHARS + 1), "value")
+    assert exc.value.code == "key_too_large"
+    assert view._metadata == {}
+    # A key of exactly the cap is still accepted.
+    boundary_key = "k" * tools._MAX_KV_KEY_CHARS
+    assert kv_set(_call(view), boundary_key, "value")["key"] == boundary_key
+    assert view._metadata == {"rex/" + boundary_key: "value"}
