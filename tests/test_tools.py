@@ -94,6 +94,16 @@ def test_string_search_filters_and_pagination() -> None:
     assert paged["truncated"] is True
 
 
+def test_string_search_caps_limit() -> None:
+    strings = [FakeStringReference(f"s{index}", 0x1000 + index) for index in range(600)]
+    view = FakeBinaryView(strings=strings)
+    _, search = get_tool("rex_string_search")
+    result = search(_call(view), limit=100000)
+    assert result["total"] == tools._MAX_LIMIT + 1
+    assert len(result["strings"]) == tools._MAX_LIMIT
+    assert result["truncated"] is True
+
+
 def test_string_search_errors() -> None:
     view = FakeBinaryView()
     _, search = get_tool("rex_string_search")
@@ -103,6 +113,10 @@ def test_string_search_errors() -> None:
     with pytest.raises(FakeToolError) as exc:
         search(_call(view), pattern="(", regex=True)
     assert exc.value.code == "invalid_regex"
+    with pytest.raises(FakeToolError) as exc:
+        search(_call(view), section="s" * 1000)
+    assert exc.value.code == "section_not_found"
+    assert "chars truncated]" in exc.value.message
 
 
 def test_data_find_finds_pattern_and_wildcards() -> None:
@@ -164,6 +178,18 @@ def test_data_find_section_limit_and_errors() -> None:
     assert exc.value.code == "invalid_pattern"
 
 
+def test_data_find_caps_limit() -> None:
+    view = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 600)],
+        memory={0x1000: b"\x90" * 600},
+    )
+    _, find = get_tool("rex_data_find")
+    result = find(_call(view), pattern="90", limit=100000)
+    assert len(result["matches"]) == tools._MAX_LIMIT
+    assert result["total"] == tools._MAX_LIMIT + 1
+    assert result["truncated"] is True
+
+
 def test_data_find_skips_unreadable_segments() -> None:
     view = FakeBinaryView(segments=[FakeSegment(0x9000, 0x10)])
     _, find = get_tool("rex_data_find")
@@ -193,6 +219,27 @@ def test_constant_find_filter_and_limit() -> None:
     limited = find(_call(view), value=0x31337, limit=1)
     assert limited["truncated"] is True
     assert len(limited["functions"]) == 1
+
+
+def test_constant_find_caps_limit_and_truncates_names() -> None:
+    operation = binaryninja.MediumLevelILOperation
+
+    def matching_function(name: str, start: int) -> FakeFunction:
+        mlil = FakeMLIL(
+            [make_mlil_instruction(operation.MLIL_CONST, constant=1, address=start + 8)]
+        )
+        return FakeFunction(name, start, start + 0x10, mlil=mlil)
+
+    functions = [
+        matching_function("f" * 1000 if index == 0 else f"f{index}", 0x1000 + index * 0x10)
+        for index in range(tools._MAX_LIMIT + 100)
+    ]
+    view = FakeBinaryView(functions=functions)
+    _, find = get_tool("rex_constant_find")
+    result = find(_call(view), value=1, limit=100000)
+    assert len(result["functions"]) == tools._MAX_LIMIT
+    assert result["truncated"] is True
+    assert result["functions"][0]["name"].endswith("chars truncated]")
 
 
 def test_function_define_and_undefine() -> None:
@@ -245,6 +292,38 @@ def test_hlil_grep_limits_and_errors() -> None:
     assert exc.value.code == "invalid_regex"
 
 
+def test_hlil_grep_caps_limit_and_max_functions() -> None:
+    matching = [
+        FakeFunction(
+            "m" * 1000 if index == 0 else f"m{index}",
+            0x1000 + index * 0x10,
+            0x1010 + index * 0x10,
+            hlil=RenderableText("call ax\n"),
+        )
+        for index in range(tools._MAX_HLIL_GREP_LIMIT + 50)
+    ]
+    view = FakeBinaryView(functions=matching)
+    _, grep = get_tool("rex_hlil_grep")
+    result = grep(_call(view), ".", limit=100000, max_functions=100000)
+    assert len(result["functions"]) == tools._MAX_HLIL_GREP_LIMIT
+    assert result["truncated"] is True
+    assert result["functions"][0]["name"].endswith("chars truncated]")
+
+    inert = [
+        FakeFunction(
+            f"n{index}",
+            0x5000 + index * 0x10,
+            0x5010 + index * 0x10,
+            hlil=RenderableText("nop\n"),
+        )
+        for index in range(tools._MAX_HLIL_GREP_FUNCTIONS + 1)
+    ]
+    inert_view = FakeBinaryView(functions=inert)
+    scanned_result = grep(_call(inert_view), "zzz", limit=100000, max_functions=100000)
+    assert scanned_result["scanned"] == tools._MAX_HLIL_GREP_FUNCTIONS
+    assert scanned_result["truncated"] is True
+
+
 def test_memory_write_validates_and_writes() -> None:
     view = FakeBinaryView()
     _, write = get_tool("rex_memory_write")
@@ -257,30 +336,44 @@ def test_memory_write_validates_and_writes() -> None:
         assert exc.value.code == "invalid_hex"
 
 
-def test_string_read_at_returns_string() -> None:
-    view = FakeBinaryView(strings=[FakeStringReference("a" * 600, 0x1100, type_name="Utf16String")])
+def test_string_read_at_truncates_and_caps_max_chars() -> None:
+    view = FakeBinaryView(
+        strings=[FakeStringReference("a" * 5000, 0x1100, type_name="Utf16String")]
+    )
     _, read = get_tool("rex_string_read_at")
     result = read(_call(view), 0x1100)
-    assert result["length"] == 600
+    assert result["length"] == 5000
     assert result["type"] == "Utf16String"
-    assert result["value"].endswith("chars truncated]")
-    assert read(_call(view), 0x1100, max_chars=1000)["value"] == "a" * 600
+    assert result["truncated"] is True
+    assert len(result["value"]) == 512 + len("... [4488 chars truncated]")
+    # max_chars can only lower the cap, never raise it past _MAX_STRING_READ_CHARS.
+    capped = read(_call(view), 0x1100, max_chars=100000000)
+    assert capped["truncated"] is True
+    assert len(capped["value"]) == tools._MAX_STRING_READ_CHARS + len("... [904 chars truncated]")
+    short = FakeBinaryView(strings=[FakeStringReference("hi", 0x1100)])
+    assert read(_call(short), 0x1100)["truncated"] is False
     with pytest.raises(FakeToolError) as exc:
         read(_call(view), 0x2000)
     assert exc.value.code == "no_string"
 
 
-def test_function_containing_lists_all() -> None:
+def test_function_containing_caps_entries_and_truncates_names() -> None:
     inner = FakeFunction("inner", 0x1150, 0x1160)
     outer = FakeFunction("outer", 0x1100, 0x1200)
-    view = FakeBinaryView(functions=[inner, outer])
-    _, containing = get_tool("rex_function_containing")
-    assert containing(_call(view), 0x1155)["functions"] == [
-        {"start": "0x1150", "name": "inner"},
-        {"start": "0x1100", "name": "outer"},
+    layers = [
+        FakeFunction("layer" + "x" * 600 if index == 0 else f"layer{index}", 0x1000, 0x2000)
+        for index in range(tools._MAX_FUNCTION_ENTRIES + 10)
     ]
+    view = FakeBinaryView(functions=[inner, outer, *layers])
+    _, containing = get_tool("rex_function_containing")
+    result = containing(_call(view), 0x1155)
+    assert len(result["functions"]) == tools._MAX_FUNCTION_ENTRIES
+    assert result["truncated"] is True
+    assert result["functions"][2]["name"].endswith("chars truncated]")
+    small = FakeBinaryView(functions=[inner, outer])
+    assert containing(_call(small), 0x1155)["truncated"] is False
     with pytest.raises(FakeToolError) as exc:
-        containing(_call(view), 0x2000)
+        containing(_call(small), 0x2000)
     assert exc.value.code == "no_function"
 
 
@@ -291,9 +384,15 @@ def test_kv_set_get_delete_roundtrip() -> None:
     _, kv_delete = get_tool("rex_kv_delete")
     assert kv_set(_call(view), "notes", "C2 at 0x401000") == {
         "key": "notes",
+        "length": 14,
         "value": "C2 at 0x401000",
+        "truncated": False,
     }
-    assert kv_get(_call(view), "notes") == {"key": "notes", "value": "C2 at 0x401000"}
+    assert kv_get(_call(view), "notes") == {
+        "key": "notes",
+        "value": "C2 at 0x401000",
+        "truncated": False,
+    }
     assert kv_delete(_call(view), "notes") == {"key": "notes"}
     with pytest.raises(FakeToolError) as exc:
         kv_get(_call(view), "notes")
@@ -308,11 +407,46 @@ def test_kv_set_get_delete_roundtrip() -> None:
         assert exc.value.code == "invalid_key"
 
 
+def test_kv_set_truncates_echo_and_rejects_oversized_value() -> None:
+    view = FakeBinaryView()
+    _, kv_set = get_tool("rex_kv_set")
+    _, kv_get = get_tool("rex_kv_get")
+    with pytest.raises(FakeToolError) as exc:
+        kv_set(_call(view), "notes", "a" * (tools._MAX_KV_VALUE_CHARS + 1))
+    assert exc.value.code == "value_too_large"
+    assert "aaaa" not in exc.value.message
+    echoed = kv_set(_call(view), "notes", "a" * 600)
+    assert echoed["length"] == 600
+    assert echoed["truncated"] is True
+    assert len(echoed["value"]) == 512 + len("... [88 chars truncated]")
+    # The stored value is untouched; only the response echo is truncated.
+    assert kv_get(_call(view), "notes")["value"] == "a" * 600
+
+
+def test_kv_get_truncates_oversized_stored_value() -> None:
+    view = FakeBinaryView()
+    view.store_metadata("rex/legacy", "b" * (tools._MAX_KV_VALUE_CHARS + 10))
+    _, kv_get = get_tool("rex_kv_get")
+    result = kv_get(_call(view), "legacy")
+    assert result["truncated"] is True
+    assert len(result["value"]) == tools._MAX_KV_VALUE_CHARS + len("... [10 chars truncated]")
+
+
+def test_kv_error_messages_truncate_key() -> None:
+    view = FakeBinaryView()
+    _, kv_get = get_tool("rex_kv_get")
+    with pytest.raises(FakeToolError) as exc:
+        kv_get(_call(view), "k" * 1000)
+    assert exc.value.code == "not_found"
+    assert "chars truncated]" in exc.value.message
+
+
 def test_call_paths_finds_caller_and_callee_paths() -> None:
     view = _view_with_functions()
     _, paths = get_tool("rex_call_paths")
     result = paths(_call(view), 0x1100, 0x3000)
     assert result["reachable"] is True
+    assert result["truncated"] is False
     assert result["paths"] == [
         [
             {"start": "0x1100", "name": "main"},
@@ -331,6 +465,7 @@ def test_call_paths_depth_shortcut_and_errors() -> None:
     assert paths(_call(view), 0x1100, 0x1100) == {
         "reachable": True,
         "paths": [[{"start": "0x1100", "name": "main"}]],
+        "truncated": False,
         "explored": 1,
     }
     with pytest.raises(FakeToolError) as exc:
@@ -338,23 +473,106 @@ def test_call_paths_depth_shortcut_and_errors() -> None:
     assert exc.value.code == "no_function"
 
 
+def test_call_paths_reports_truncation_and_caps_depth() -> None:
+    view = _view_with_functions()
+    extra = FakeFunction("extra", 0x5000, 0x5100)
+    view.functions[0].callers.append(extra)
+    _, paths = get_tool("rex_call_paths")
+    # The search stops with one path in hand and "extra" still queued.
+    result = paths(_call(view), 0x1100, 0x3000, max_paths=1)
+    assert result["reachable"] is True
+    assert result["truncated"] is True
+    assert len(result["paths"]) == 1
+
+    chain = [
+        FakeFunction(f"f{index}", 0x1000 + index * 0x10, 0x1010 + index * 0x10)
+        for index in range(20)
+    ]
+    for index in range(19):
+        chain[index].callers = [chain[index + 1]]
+    chain_view = FakeBinaryView(functions=chain)
+    # max_depth=100 would reach the 20-deep target unclamped; the cap keeps it unreachable.
+    assert paths(_call(chain_view), 0x1000, 0x1000 + 19 * 0x10, max_depth=100)["reachable"] is False
+
+
 def test_eval_python_executes_code() -> None:
     view = _view_with_functions()
     _, evaluate = get_tool("rex_eval_python")
     result = evaluate(_call(view), "print('hi')\nresult = len(bv.functions)")
     assert result["stdout"] == "hi\n"
+    assert result["stdout_truncated"] is False
     assert result["result"] == "3"
-    assert evaluate(_call(view), "1 + 1") == {"stdout": "", "result": None}
+    assert result["result_truncated"] is False
+    assert result["error"] is None
+    assert result["error_truncated"] is False
+    assert evaluate(_call(view), "1 + 1")["result"] is None
+
+
+def test_eval_python_truncates_stdout_and_result() -> None:
+    view = _view_with_functions()
+    _, evaluate = get_tool("rex_eval_python")
+    result = evaluate(
+        _call(view),
+        f"print('x' * {tools._MAX_EVAL_STDOUT_CHARS + 10})\n"
+        f"result = 'y' * {tools._MAX_EVAL_RESULT_CHARS + 10}",
+    )
+    assert result["stdout_truncated"] is True
+    assert result["stdout"].startswith("x" * 10)
+    assert len(result["stdout"]) == tools._MAX_EVAL_STDOUT_CHARS + len("... [11 chars truncated]")
+    assert result["result_truncated"] is True
+    # repr() wraps the string in quotes, so the truncated result starts with one.
+    assert result["result"].startswith("'" + "y" * 10)
+    assert len(result["result"]) == tools._MAX_EVAL_RESULT_CHARS + len("... [12 chars truncated]")
+    assert result["error"] is None
+
+
+def test_eval_python_returns_truncated_error_instead_of_raising() -> None:
+    view = _view_with_functions()
+    _, evaluate = get_tool("rex_eval_python")
+    result = evaluate(_call(view), "print('before')\nraise ValueError('z' * 1000)")
+    assert result["stdout"] == "before\n"
+    assert result["result"] is None
+    assert result["result_truncated"] is False
+    assert result["error"] is not None
+    assert result["error"].startswith("zzz")
+    assert result["error_truncated"] is True
+    assert len(result["error"]) == 512 + len("... [488 chars truncated]")
 
 
 def test_tag_set_creates_missing_type() -> None:
     view = FakeBinaryView()
     _, tag_set = get_tool("rex_tag_set")
     result = tag_set(_call(view), 0x4010, "Finding", "C2 config")
-    assert result == {"address": "0x4010", "tag_type": "Finding", "data": "C2 config"}
+    assert result == {
+        "address": "0x4010",
+        "tag_type": "Finding",
+        "data": "C2 config",
+        "data_truncated": False,
+        "length": 9,
+    }
     assert "Finding" in view.tag_types
     tag_set(_call(view), 0x4020, "Finding", "second")
     assert [tag.data for _, tag in view.get_tags()] == ["C2 config", "second"]
+
+
+def test_tag_set_caps_data_and_truncates_echo() -> None:
+    view = FakeBinaryView()
+    _, tag_set = get_tool("rex_tag_set")
+    with pytest.raises(FakeToolError) as exc:
+        tag_set(_call(view), 0x4010, "Finding", "d" * (tools._MAX_TAG_DATA_CHARS + 1))
+    assert exc.value.code == "data_too_large"
+    assert "dddd" not in exc.value.message
+    with pytest.raises(FakeToolError) as exc:
+        tag_set(_call(view), 0x4010, "T" * 1000, "x", create_missing=False)
+    assert exc.value.code == "tag_type_not_found"
+    assert "chars truncated]" in exc.value.message
+    result = tag_set(_call(view), 0x4010, "F" * 1000, "d" * 600)
+    assert result["tag_type"].endswith("chars truncated]")
+    assert result["data_truncated"] is True
+    assert len(result["data"]) == 512 + len("... [88 chars truncated]")
+    assert result["length"] == 600
+    # The stored tag data is untouched; only the response echo is truncated.
+    assert [tag.data for _, tag in view.get_tags()] == ["d" * 600]
 
 
 def test_tag_set_without_create_and_listing() -> None:
@@ -370,3 +588,19 @@ def test_tag_set_without_create_and_listing() -> None:
     assert result["total"] == 2
     assert result["truncated"] is True
     assert result["tags"][0]["data"] == "a"
+    assert result["tags"][0]["data_truncated"] is False
+
+
+def test_tag_list_caps_limit_and_truncates_data() -> None:
+    view = FakeBinaryView()
+    view.add_tag(0x1000, "Finding", "a" * 600)
+    for index in range(600):
+        view.add_tag(0x2000 + index, "Finding", f"n{index}")
+    _, tag_list = get_tool("rex_tag_list")
+    result = tag_list(_call(view), limit=100000)
+    assert result["total"] == 601
+    assert len(result["tags"]) == tools._MAX_LIMIT
+    assert result["truncated"] is True
+    assert result["tags"][0]["data_truncated"] is True
+    assert result["tags"][0]["data"].endswith("chars truncated]")
+    assert result["tags"][1]["data_truncated"] is False

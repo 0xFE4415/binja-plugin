@@ -10,7 +10,7 @@ import contextlib
 import io
 import re
 from collections import deque
-from typing import Literal
+from typing import Annotated, Literal
 
 import binaryninja
 from binaryninja import mcp
@@ -23,15 +23,32 @@ from binja_plugin.hexpattern import HexPatternError, compile_hex_pattern
 
 _READ_CHUNK = 4 * 1024 * 1024
 _MAX_CHARS = 512
+# Hard caps for list sizes and echoed strings: every user-supplied limit is clamped to
+# these in the tool bodies so the caps hold even when handlers are invoked directly.
+_MAX_LIMIT = 500
+_MAX_HLIL_GREP_LIMIT = 200
+_MAX_HLIL_GREP_FUNCTIONS = 5000
+_MAX_CALL_PATH_DEPTH = 16
+_MAX_CALL_PATHS = 50
+_MAX_FUNCTION_ENTRIES = 50
+_MAX_EVAL_STDOUT_CHARS = 65536
+_MAX_EVAL_RESULT_CHARS = 16384
+_MAX_KV_VALUE_CHARS = 65536
+_MAX_TAG_DATA_CHARS = 65536
+_MAX_STRING_READ_CHARS = 4096
 _METADATA_PREFIX = "rex/"
 _TAG_ICON = "\u25c6"
 _STRING_TYPES = Literal["AsciiString", "Utf16String", "Utf32String", "Utf8String"]
 
 
-def _truncate(value: str, limit: int = _MAX_CHARS) -> str:
+def _truncate_with_flag(value: str, limit: int = _MAX_CHARS) -> tuple[str, bool]:
     if len(value) <= limit:
-        return value
-    return value[:limit] + f"... [{len(value) - limit} chars truncated]"
+        return value, False
+    return value[:limit] + f"... [{len(value) - limit} chars truncated]", True
+
+
+def _truncate(value: str, limit: int = _MAX_CHARS) -> str:
+    return _truncate_with_flag(value, limit)[0]
 
 
 def _compile_user_regex(pattern: str, ignore_case: bool = False) -> re.Pattern[str]:
@@ -51,7 +68,7 @@ def _name_filter(function_filter: str) -> re.Pattern[str] | None:
 def _resolve_section(bv: BinaryView, name: str) -> tuple[int, int]:
     section = bv.get_section_by_name(name)
     if section is None:
-        raise mcp.ToolError("section_not_found", f"no section named '{name}'")
+        raise mcp.ToolError("section_not_found", f"no section named '{_truncate(name)}'")
     return section.start, section.end
 
 
@@ -63,7 +80,7 @@ def _require_function(bv: BinaryView, address: int) -> Function:
 
 
 def _function_entry(function: Function) -> dict[str, object]:
-    return {"start": hex(function.start), "name": function.name}
+    return {"start": hex(function.start), "name": _truncate(function.name)}
 
 
 def _iter_mlil_constants(instruction: MediumLevelILInstruction):
@@ -88,8 +105,8 @@ def rex_call_paths(
     from_addr: mcp.Address,
     to_addr: mcp.Address,
     direction: Literal["callers", "callees"] = "callers",
-    max_depth: int = 8,
-    max_paths: int = 5,
+    max_depth: Annotated[int, mcp.ClampTo(1, _MAX_CALL_PATH_DEPTH)] = 8,
+    max_paths: Annotated[int, mcp.ClampTo(1, _MAX_CALL_PATHS)] = 5,
 ) -> dict[str, object]:
     """Bounded breadth-first search for call paths between two functions.
 
@@ -100,11 +117,18 @@ def rex_call_paths(
     :param max_paths: Maximum number of paths to return.
     """
     bv = call.binary_view
+    max_depth = min(max_depth, _MAX_CALL_PATH_DEPTH)
+    max_paths = min(max_paths, _MAX_CALL_PATHS)
     source = _require_function(bv, from_addr)
     target = _require_function(bv, to_addr)
     paths: list[list[dict[str, object]]] = []
     if source.start == target.start:
-        return {"reachable": True, "paths": [[_function_entry(source)]], "explored": 1}
+        return {
+            "reachable": True,
+            "paths": [[_function_entry(source)]],
+            "truncated": False,
+            "explored": 1,
+        }
     queue: deque[tuple[Function, list[Function]]] = deque([(source, [source])])
     visited = {source.start}
     explored = 0
@@ -123,12 +147,16 @@ def rex_call_paths(
             elif neighbor.start not in visited:
                 visited.add(neighbor.start)
                 queue.append((neighbor, [*path, neighbor]))
-    return {"reachable": bool(paths), "paths": paths, "explored": explored}
+    truncated = len(paths) > max_paths or (len(paths) >= max_paths and bool(queue))
+    return {"reachable": bool(paths), "paths": paths, "truncated": truncated, "explored": explored}
 
 
 @mcp.tool(read_only=True)
 def rex_constant_find(
-    call: mcp.ToolCall, value: int, function_filter: str = "", limit: int = 50
+    call: mcp.ToolCall,
+    value: int,
+    function_filter: str = "",
+    limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
 ) -> dict[str, object]:
     """Find functions whose MLIL references an immediate constant value.
 
@@ -137,6 +165,7 @@ def rex_constant_find(
     :param limit: Maximum number of matching functions to return.
     """
     bv = call.binary_view
+    limit = min(limit, _MAX_LIMIT)
     name_matcher = _name_filter(function_filter)
     functions: list[dict[str, object]] = []
     truncated = False
@@ -159,7 +188,7 @@ def rex_constant_find(
             functions.append(
                 {
                     "start": hex(function.start),
-                    "name": function.name,
+                    "name": _truncate(function.name),
                     "addresses": addresses[:6],
                 }
             )
@@ -171,7 +200,7 @@ def rex_data_find(
     call: mcp.ToolCall,
     pattern: str,
     section: str | None = None,
-    limit: int = 50,
+    limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
     offset: int = 0,
 ) -> dict[str, object]:
     """Find all occurrences of a hex byte pattern in mapped memory.
@@ -182,6 +211,7 @@ def rex_data_find(
     :param offset: Number of matches to skip before collecting results.
     """
     bv = call.binary_view
+    limit = min(limit, _MAX_LIMIT)
     try:
         matcher, pattern_length = compile_hex_pattern(pattern)
     except HexPatternError as exc:
@@ -235,10 +265,36 @@ def rex_eval_python(call: mcp.ToolCall, code: str) -> dict[str, object]:
         "bn": binaryninja,
     }
     buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        exec(code, namespace)
-    result = repr(namespace["result"]) if "result" in namespace else None
-    return {"stdout": buffer.getvalue(), "result": result}
+    try:
+        with contextlib.redirect_stdout(buffer):
+            exec(code, namespace)
+    except Exception as error:
+        # Keep failures out of the mcp layer's uncapped str(error) ToolError path.
+        stdout, stdout_truncated = _truncate_with_flag(buffer.getvalue(), _MAX_EVAL_STDOUT_CHARS)
+        message, error_truncated = _truncate_with_flag(str(error))
+        return {
+            "stdout": stdout,
+            "stdout_truncated": stdout_truncated,
+            "result": None,
+            "result_truncated": False,
+            "error": message,
+            "error_truncated": error_truncated,
+        }
+    stdout, stdout_truncated = _truncate_with_flag(buffer.getvalue(), _MAX_EVAL_STDOUT_CHARS)
+    if "result" in namespace:
+        result, result_truncated = _truncate_with_flag(
+            repr(namespace["result"]), _MAX_EVAL_RESULT_CHARS
+        )
+    else:
+        result, result_truncated = None, False
+    return {
+        "stdout": stdout,
+        "stdout_truncated": stdout_truncated,
+        "result": result,
+        "result_truncated": result_truncated,
+        "error": None,
+        "error_truncated": False,
+    }
 
 
 @mcp.tool(read_only=True)
@@ -250,7 +306,10 @@ def rex_function_containing(call: mcp.ToolCall, addr: mcp.Address) -> dict[str, 
     functions = call.binary_view.get_functions_containing(addr)
     if not functions:
         raise mcp.ToolError("no_function", f"no function contains {addr:#x}")
-    return {"functions": [_function_entry(function) for function in functions]}
+    return {
+        "functions": [_function_entry(function) for function in functions[:_MAX_FUNCTION_ENTRIES]],
+        "truncated": len(functions) > _MAX_FUNCTION_ENTRIES,
+    }
 
 
 @mcp.tool()
@@ -281,8 +340,8 @@ def rex_hlil_grep(
     call: mcp.ToolCall,
     regex: str,
     function_filter: str = "",
-    limit: int = 20,
-    max_functions: int = 2000,
+    limit: Annotated[int, mcp.ClampTo(0, _MAX_HLIL_GREP_LIMIT)] = 20,
+    max_functions: Annotated[int, mcp.ClampTo(0, _MAX_HLIL_GREP_FUNCTIONS)] = 2000,
 ) -> dict[str, object]:
     """Search rendered HLIL text across functions with a regular expression.
 
@@ -292,6 +351,8 @@ def rex_hlil_grep(
     :param max_functions: Maximum number of functions to scan before stopping.
     """
     bv = call.binary_view
+    limit = min(limit, _MAX_HLIL_GREP_LIMIT)
+    max_functions = min(max_functions, _MAX_HLIL_GREP_FUNCTIONS)
     matcher = _compile_user_regex(regex)
     name_matcher = _name_filter(function_filter)
     matches: list[dict[str, object]] = []
@@ -312,7 +373,7 @@ def rex_hlil_grep(
             matches.append(
                 {
                     "start": hex(function.start),
-                    "name": function.name,
+                    "name": _truncate(function.name),
                     "lines": [_truncate(line) for line in lines[:3]],
                 }
             )
@@ -328,7 +389,7 @@ def rex_kv_delete(call: mcp.ToolCall, key: str) -> dict[str, object]:
     if not key:
         raise mcp.ToolError("invalid_key", "key must not be empty")
     call.binary_view.remove_metadata(_METADATA_PREFIX + key)
-    return {"key": key}
+    return {"key": _truncate(key)}
 
 
 @mcp.tool(read_only=True)
@@ -342,8 +403,9 @@ def rex_kv_get(call: mcp.ToolCall, key: str) -> dict[str, object]:
     try:
         value = call.binary_view.query_metadata(_METADATA_PREFIX + key)
     except Exception:
-        raise mcp.ToolError("not_found", f"no value stored under '{key}'") from None
-    return {"key": key, "value": str(value)}
+        raise mcp.ToolError("not_found", f"no value stored under '{_truncate(key)}'") from None
+    text, truncated = _truncate_with_flag(str(value), _MAX_KV_VALUE_CHARS)
+    return {"key": _truncate(key), "value": text, "truncated": truncated}
 
 
 @mcp.tool()
@@ -357,8 +419,11 @@ def rex_kv_set(call: mcp.ToolCall, key: str, value: str) -> dict[str, object]:
     """
     if not key:
         raise mcp.ToolError("invalid_key", "key must not be empty")
+    if len(value) > _MAX_KV_VALUE_CHARS:
+        raise mcp.ToolError("value_too_large", f"value exceeds {_MAX_KV_VALUE_CHARS} characters")
     call.binary_view.store_metadata(_METADATA_PREFIX + key, value)
-    return {"key": key, "value": value}
+    preview, truncated = _truncate_with_flag(value)
+    return {"key": _truncate(key), "length": len(value), "value": preview, "truncated": truncated}
 
 
 @mcp.tool(destructive=True)
@@ -381,7 +446,9 @@ def rex_memory_write(call: mcp.ToolCall, addr: mcp.Address, hex_data: str) -> di
 
 @mcp.tool(read_only=True)
 def rex_string_read_at(
-    call: mcp.ToolCall, addr: mcp.Address, max_chars: int = _MAX_CHARS
+    call: mcp.ToolCall,
+    addr: mcp.Address,
+    max_chars: Annotated[int, mcp.ClampTo(1, _MAX_STRING_READ_CHARS)] = _MAX_CHARS,
 ) -> dict[str, object]:
     """Read the detected string at an address.
 
@@ -391,11 +458,13 @@ def rex_string_read_at(
     string = call.binary_view.get_string_at(addr)
     if string is None:
         raise mcp.ToolError("no_string", f"no detected string at {addr:#x}")
+    value, truncated = _truncate_with_flag(string.value, min(max_chars, _MAX_STRING_READ_CHARS))
     return {
         "address": hex(string.start),
         "length": len(string),
         "type": string.type.name,
-        "value": _truncate(string.value, max_chars),
+        "value": value,
+        "truncated": truncated,
     }
 
 
@@ -407,7 +476,7 @@ def rex_string_search(
     ignore_case: bool = False,
     section: str | None = None,
     string_type: _STRING_TYPES | None = None,
-    limit: int = 50,
+    limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 50,
     offset: int = 0,
 ) -> dict[str, object]:
     """Search the binary's detected strings by substring or regular expression.
@@ -421,6 +490,7 @@ def rex_string_search(
     :param offset: Number of matching strings to skip before collecting results.
     """
     bv = call.binary_view
+    limit = min(limit, _MAX_LIMIT)
     matcher = _compile_user_regex(pattern, ignore_case=ignore_case) if regex else None
     bounds = _resolve_section(bv, section) if section is not None else None
     total = 0
@@ -457,15 +527,25 @@ def rex_string_search(
 
 
 @mcp.tool(read_only=True)
-def rex_tag_list(call: mcp.ToolCall, limit: int = 100) -> dict[str, object]:
+def rex_tag_list(
+    call: mcp.ToolCall, limit: Annotated[int, mcp.ClampTo(0, _MAX_LIMIT)] = 100
+) -> dict[str, object]:
     """List the tags set on the binary view.
 
     :param limit: Maximum number of tags to return.
     """
-    tags = [
-        {"address": hex(address), "tag_type": tag.type.name, "data": tag.data}
-        for address, tag in call.binary_view.get_tags()
-    ]
+    limit = min(limit, _MAX_LIMIT)
+    tags = []
+    for address, tag in call.binary_view.get_tags():
+        data, data_truncated = _truncate_with_flag(tag.data)
+        tags.append(
+            {
+                "address": hex(address),
+                "tag_type": tag.type.name,
+                "data": data,
+                "data_truncated": data_truncated,
+            }
+        )
     return {"total": len(tags), "truncated": len(tags) > limit, "tags": tags[:limit]}
 
 
@@ -481,9 +561,18 @@ def rex_tag_set(
     :param create_missing: Create tag_type when it does not exist yet.
     """
     bv = call.binary_view
+    if len(data) > _MAX_TAG_DATA_CHARS:
+        raise mcp.ToolError("data_too_large", f"tag data exceeds {_MAX_TAG_DATA_CHARS} characters")
     if tag_type not in bv.tag_types:
         if not create_missing:
-            raise mcp.ToolError("tag_type_not_found", f"no tag type named '{tag_type}'")
+            raise mcp.ToolError("tag_type_not_found", f"no tag type named '{_truncate(tag_type)}'")
         bv.create_tag_type(tag_type, _TAG_ICON)
     bv.add_tag(addr, tag_type, data)
-    return {"address": hex(addr), "tag_type": tag_type, "data": data}
+    data_preview, data_truncated = _truncate_with_flag(data)
+    return {
+        "address": hex(addr),
+        "tag_type": _truncate(tag_type),
+        "data": data_preview,
+        "data_truncated": data_truncated,
+        "length": len(data),
+    }

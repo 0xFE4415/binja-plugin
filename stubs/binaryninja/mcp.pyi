@@ -20,6 +20,21 @@ class McpToolAnnotation(IntFlag):
 class Address(int): ...
 
 
+class Minimum:
+    def __init__(self, value: int) -> None: ...
+
+
+class Maximum:
+    def __init__(self, value: int) -> None: ...
+
+
+class ClampTo:
+    minimum: int
+    maximum: int
+
+    def __init__(self, minimum: int, maximum: int) -> None: ...
+
+
 class IntegerExpression(int): ...
 
 
