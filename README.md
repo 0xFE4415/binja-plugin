@@ -25,7 +25,7 @@ clients that already connected must reconnect to see the registered `rex_*` tool
 
 | Tool | Notes |
 | --- | --- |
-| `rex_string_search` | Substring/regex search over detected strings, with section and type filters. |
+| `rex_string_search` | Substring/regex search over strings, with section and type filters. |
 | `rex_data_find` | Hex byte pattern search (`??` wildcards) over mapped segments. |
 | `rex_constant_find` | Find functions whose MLIL references an immediate constant. |
 | `rex_hlil_grep` | Regular expression search across rendered HLIL text. |
@@ -37,7 +37,7 @@ clients that already connected must reconnect to see the registered `rex_*` tool
 | `rex_memory_write` | Patch bytes in the binary view (destructive). |
 | `rex_tag_set` | Attach a GUI-visible tag at an address, creating the tag type on demand. |
 | `rex_tag_list` | List the tags set on the binary view. |
-| `rex_kv_set` / `rex_kv_get` / `rex_kv_delete` | Persistent scratch key-value store in the database. |
+| `rex_kv_set` / `rex_kv_get` / `rex_kv_delete` | Persistent scratch key-value store. |
 | `rex_eval_python` | Arbitrary `binaryninja` Python scripting (destructive escape hatch). |
 
 Search tools return `total`, `truncated`, and paginated results via `limit`/`offset` so
