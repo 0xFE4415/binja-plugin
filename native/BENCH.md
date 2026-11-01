@@ -29,7 +29,7 @@ python3 native/bench_mcp.py --check-only   # from the repository root
 
 Expected output on success:
 
-```
+```text
 handshake ok; 90 tools registered; rx_* and rex_* both present
 ```
 
