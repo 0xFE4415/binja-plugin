@@ -10,14 +10,26 @@ description = "Native Rust MCP tools for the binja-plugin Binary Ninja plugin"
 [lib]
 crate-type = ["cdylib"]
 
+# `core` links the real libbinaryninjacore (default — what installs as a
+# plugin). Building without it compiles a stub core via cmake instead, which
+# lets `cargo test`/`clippy` run without a Binary Ninja install (nox native,
+# CI). `--no-default-features` only strips OUR defaults, so the wrapper
+# dependency must carry default-features = false or its own `core` default
+# would silently re-enable real-core linking.
+[features]
+default = ["core"]
+core = ["binaryninja/core"]
+
 # Both crates must be pinned to the same revision of binaryninja-api, ideally
 # the commit this Binary Ninja build was made from (api_REVISION.txt). The sys
 # crate is a direct dependency so the DEP_BINARYNINJACORE_PATH linker handshake
 # propagates to our build script (links = "binaryninjacore" only reaches direct
 # dependents).
 [dependencies]
-binaryninja = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "403768cfc906aaf8cf4903dfdded4da4c02af5fd", features = ["schemars"] }
-binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "403768cfc906aaf8cf4903dfdded4da4c02af5fd" }
+binaryninja = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "403768cfc906aaf8cf4903dfdded4da4c02af5fd", default-features = false, features = ["schemars"] }
+# default-features = false: the sys crate itself defaults to core; without
+# this, --no-default-features on our crate could never reach stub mode.
+binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "403768cfc906aaf8cf4903dfdded4da4c02af5fd", default-features = false }
 serde = { version = "1", features = ["derive"] }
 schemars = "1"
 serde_json = "1"
