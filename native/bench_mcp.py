@@ -194,7 +194,8 @@ def bench_single(client: McpClient, repetitions: int, args: argparse.Namespace) 
 
 def bench_multi(client: McpClient, repetitions: int, args: argparse.Namespace) -> bool:
     """Headliner: rx_multi_find vs N sequential rex_data_find calls."""
-    print(f"\n== {len(args.patterns)} patterns in one pass "
+    count = len(args.patterns)
+    print(f"\n== {count} {'pattern' if count == 1 else 'patterns'} in one pass "
           f"(section={args.section or 'all mapped segments'}, limit=50) ==")
     multi_arguments = {
         "binary": args.binary,
