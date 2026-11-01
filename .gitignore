@@ -13,3 +13,4 @@ uv.lock
 .coverage.*
 htmlcov/
 coverage.xml
+native/target/

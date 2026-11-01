@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import nox
 
 nox.options.default_venv_backend = "uv|virtualenv"
@@ -26,6 +29,39 @@ def ty(session: nox.Session) -> None:
 def test(session: nox.Session) -> None:
     session.install("-e", ".[test]")
     session.run("pytest", *session.posargs)
+
+
+@nox.session(python=False)
+def native(session: nox.Session) -> None:
+    """Rust gates in stub-core mode, so they run without a Binary Ninja install.
+
+    The stub mode compiles a stub binaryninjacore via cmake (needs clang, cmake,
+    ninja); tests are pure logic and never call the core, so they are valid in
+    both modes. The real-core build happens at install time
+    (native/scripts/install.sh).
+    """
+    session.chdir("native")
+    # Prefer the rustup toolchain when present: some distros ship a system
+    # cargo of a different build, and mixing compilers in one target/ fails
+    # with E0514 (artifacts compiled by an incompatible rustc). rustup reads
+    # native/rust-toolchain.toml to pick the pinned channel.
+    env = dict(os.environ)
+    rustup_bin = Path.home() / ".cargo" / "bin"
+    if rustup_bin.is_dir():
+        env["PATH"] = f"{rustup_bin}:{env['PATH']}"
+    session.run("cargo", "fmt", "--check", external=True, env=env)
+    session.run(
+        "cargo",
+        "clippy",
+        "--all-targets",
+        "--no-default-features",
+        "--",
+        "-D",
+        "warnings",
+        external=True,
+        env=env,
+    )
+    session.run("cargo", "test", "--no-default-features", external=True, env=env)
 
 
 @nox.session

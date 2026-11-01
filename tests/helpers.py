@@ -79,22 +79,6 @@ def install_fake_binaryninja() -> None:
         ),
     )
 
-    enums_module = types.ModuleType("binaryninja.enums")
-    setattr(
-        enums_module,
-        "MediumLevelILOperation",
-        enum.IntEnum(
-            "MediumLevelILOperation", {"MLIL_SET_VAR": 0, "MLIL_CONST": 15, "MLIL_CONST_PTR": 16}
-        ),
-    )
-
-    il_module = types.ModuleType("binaryninja.mediumlevelil")
-
-    class FakeMediumLevelILInstruction:
-        pass
-
-    setattr(il_module, "MediumLevelILInstruction", FakeMediumLevelILInstruction)
-
     bv_module = types.ModuleType("binaryninja.binaryview")
 
     class FakeBinaryViewBase:
@@ -111,18 +95,12 @@ def install_fake_binaryninja() -> None:
 
     package = types.ModuleType("binaryninja")
     setattr(package, "mcp", mcp_module)
-    setattr(package, "enums", enums_module)
-    setattr(package, "mediumlevelil", il_module)
     setattr(package, "binaryview", bv_module)
     setattr(package, "function", fn_module)
-    setattr(package, "MediumLevelILOperation", enums_module.MediumLevelILOperation)
-    setattr(package, "MediumLevelILInstruction", FakeMediumLevelILInstruction)
 
     for name, module in (
         ("binaryninja", package),
         ("binaryninja.mcp", mcp_module),
-        ("binaryninja.enums", enums_module),
-        ("binaryninja.mediumlevelil", il_module),
         ("binaryninja.binaryview", bv_module),
         ("binaryninja.function", fn_module),
     ):
@@ -173,11 +151,6 @@ class RenderableText:
         return self._text
 
 
-class FakeMLIL:
-    def __init__(self, instructions: list[object]) -> None:
-        self.instructions = instructions
-
-
 class FakeLinearDisassemblyLine:
     """Mirrors the LinearDisassemblyLine yielded by BinaryView.find_all_constant."""
 
@@ -193,7 +166,6 @@ class FakeFunction:
         end: int,
         *,
         hlil: object = None,
-        mlil: object = None,
         callers: list[FakeFunction] | None = None,
         callees: list[FakeFunction] | None = None,
     ) -> None:
@@ -201,25 +173,8 @@ class FakeFunction:
         self.start = start
         self.end = end
         self.hlil = hlil
-        self.mlil = mlil
         self.callers = callers if callers is not None else []
         self.callees = callees if callees is not None else []
-
-
-def make_mlil_instruction(
-    operation: object,
-    *,
-    constant: int | None = None,
-    operands: list[object] | None = None,
-    address: int = 0,
-) -> object:
-    base = getattr(sys.modules["binaryninja.mediumlevelil"], "MediumLevelILInstruction")
-    instruction = base()
-    instruction.operation = operation
-    instruction.constant = constant
-    instruction.operands = operands if operands is not None else []
-    instruction.address = address
-    return instruction
 
 
 class FakeBinaryView:

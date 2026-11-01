@@ -1,0 +1,6 @@
+# Pin the Rust toolchain so every rustup-shimmed invocation (nox native
+# session, install.sh) uses the same compiler. A distro may ship its own
+# system rustc of a different build, and artifacts from the two are
+# incompatible (E0514) — keep all builds on this pinned toolchain.
+[toolchain]
+channel = "stable"

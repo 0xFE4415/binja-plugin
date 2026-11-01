@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import binaryninja
 import pytest
 from helpers import (
     FakeBinaryView,
     FakeFunction,
-    FakeMLIL,
     FakeSegment,
     FakeStringReference,
     FakeToolCall,
     FakeToolError,
     RenderableText,
     get_tool,
-    make_mlil_instruction,
 )
 
 from binja_plugin import tools
@@ -23,35 +20,11 @@ def _call(view: FakeBinaryView) -> FakeToolCall:
 
 
 def _view_with_functions() -> FakeBinaryView:
-    operation = binaryninja.MediumLevelILOperation
-    main_mlil = FakeMLIL(
-        [
-            make_mlil_instruction(
-                operation.MLIL_SET_VAR,
-                operands=[
-                    make_mlil_instruction(operation.MLIL_CONST, constant=0x31337, address=0x1140)
-                ],
-                address=0x1140,
-            ),
-            make_mlil_instruction(
-                operation.MLIL_SET_VAR,
-                operands=[
-                    make_mlil_instruction(
-                        operation.MLIL_CONST_PTR, constant=0x2000, address=0x1150
-                    ),
-                    [make_mlil_instruction(operation.MLIL_CONST, constant=0x1234, address=0x1151)],
-                    7,
-                ],
-                address=0x1150,
-            ),
-        ]
-    )
     main = FakeFunction(
         "main",
         0x1100,
         0x1200,
         hlil=RenderableText("void main() {\n    if (recv(fd, buf, n) <= 0)\n        return 1;\n}"),
-        mlil=main_mlil,
     )
     handler = FakeFunction("handler", 0x2000, 0x2100)
     sink = FakeFunction("sink", 0x3000, 0x3100)
@@ -370,6 +343,10 @@ def test_constant_find_offset_and_limit() -> None:
     assert find(_call(view), value=0x31337, function_filter="nomatch")["functions"] == []
     filtered = find(_call(view), value=0x31337, function_filter="^main$")
     assert [entry["name"] for entry in filtered["functions"]] == ["main"]
+    # The docstring promises a case-insensitive name match; pin it with a
+    # case-mismatched positive, not just a same-case one.
+    caseless = find(_call(view), value=0x31337, function_filter="^HANDLER$")
+    assert [entry["name"] for entry in caseless["functions"]] == ["handler"]
     assert find(_call(view), value=0x31337, limit=5, offset=5) == {
         "truncated": False,
         "functions": [],
@@ -507,6 +484,10 @@ def test_hlil_grep_limits_and_errors() -> None:
     assert skipped["scanned"] == 0
     assert skipped["functions"] == []
     assert skipped["truncated"] is False
+    # The docstring promises a case-insensitive name match; pin it with a
+    # case-mismatched positive (uppercase filter, lowercase function name).
+    caseless = grep(_call(view), "recv", function_filter="MAIN")
+    assert [entry["name"] for entry in caseless["functions"]] == ["main"]
     limited = grep(_call(view), ".", limit=0)
     assert limited["truncated"] is True
     assert limited["functions"] == []

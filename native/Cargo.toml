@@ -1,0 +1,30 @@
+[package]
+name = "binja_plugin_native"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Native Rust MCP tools for the binja-plugin Binary Ninja plugin"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+# Both crates must be pinned to the same revision of binaryninja-api, ideally
+# the commit this Binary Ninja build was made from (api_REVISION.txt). The sys
+# crate is a direct dependency so the DEP_BINARYNINJACORE_PATH linker handshake
+# propagates to our build script (links = "binaryninjacore" only reaches direct
+# dependents).
+[dependencies]
+binaryninja = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "403768cfc906aaf8cf4903dfdded4da4c02af5fd", features = ["schemars"] }
+binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "403768cfc906aaf8cf4903dfdded4da4c02af5fd" }
+serde = { version = "1", features = ["derive"] }
+schemars = "1"
+serde_json = "1"
+memchr = "2"
+aho-corasick = "1"
+
+[profile.release]
+# Keep unwinding so a panicking MCP tool becomes an internal_error result
+# instead of ending the Binary Ninja process (see mcp-tools.html).
+panic = "unwind"
