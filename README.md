@@ -40,9 +40,14 @@ clients that already connected must reconnect to see the registered tools.
 | `rex_data_find` | Hex byte pattern search (`??` wildcards) over mapped segments. |
 | `rex_constant_find` | Finds constant references via the core's linear-view constant search. |
 | `rex_hlil_grep` | Regular expression search across rendered HLIL text, with a resumable cursor. |
+| `rex_find_functions_by_pattern` | Maps a byte pattern to the functions containing its matches. |
 | `rx_data_find` | The `rex_data_find` contract with the scan in native Rust (~7x faster). |
 | `rx_multi_find` | Many hex patterns in one pass via a multi-pattern automaton (Rust). |
 | `rex_call_paths` | Bounded breadth-first call-path search between two functions. |
+| `rex_disasm_at` | Address-anchored disassembly window, clipped at the function's edges. |
+| `rex_decompile_many` | HLIL render for up to 16 functions in one batch call. |
+| `rex_export_disasm` | Write a function's disassembly window to a file. |
+| `rex_export_symbols` | Write a symbol address range to a file in the export root. |
 | `rex_function_containing` | List the functions containing an address. |
 | `rex_function_define` | Turn the bytes at an address into a function. |
 | `rex_function_undefine` | Remove the function covering an address (destructive). |
@@ -63,7 +68,7 @@ data, key values, `rex_eval_python` output) are additionally capped in length, w
 
 ## Bounds on database-wide scans
 
-On a six-figure-function database the two whole-database searches are bounded per
+On a six-figure-function database the whole-database searches are bounded per
 invocation:
 
 - `rex_constant_find` runs the core's linear-view constant search (the engine behind
@@ -76,6 +81,11 @@ invocation:
   first render of a function's HLIL costs tens of milliseconds, so large databases are
   paged: each result carries `next_offset`, and callers pass it back as `offset` until
   `truncated` is false.
+- `rex_find_functions_by_pattern` scans mapped memory with chunked reads and stops at the
+  first matching function past the requested `limit`/`offset` window. Functions inside the
+  window report a true match count, so every match inside an in-window function is still
+  counted; the per-match work is a core containment query, and matches in data or between
+  functions are skipped cheaply.
 
 ## Known limits
 
