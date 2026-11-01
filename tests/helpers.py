@@ -158,6 +158,19 @@ class FakeLinearDisassemblyLine:
         self.function = function
 
 
+class FakeSymbol:
+    """Mirrors the CoreSymbol fields rex_export_symbols reads.
+
+    ``type`` is a namespace with ``name`` like the other fakes, mirroring the enum
+    member the real core hands back.
+    """
+
+    def __init__(self, address: int, type_name: str, name: str) -> None:
+        self.address = address
+        self.type = types.SimpleNamespace(name=type_name)
+        self.name = name
+
+
 class FakeFunction:
     def __init__(
         self,
@@ -189,6 +202,7 @@ class FakeBinaryView:
         start: int = 0,
         end: int = 0x10000,
         constant_references: list[tuple[int, int, FakeFunction | None]] | None = None,
+        symbols: list[FakeSymbol] | None = None,
     ) -> None:
         self.strings = strings if strings is not None else []
         self.segments = segments if segments is not None else []
@@ -206,6 +220,7 @@ class FakeBinaryView:
         # (value, address, function) triples answered by find_all_constant; a None
         # function models a match on a line that belongs to no function (data text).
         self.constant_references = constant_references or []
+        self._symbols: list[FakeSymbol] = symbols if symbols is not None else []
         self.constant_scan_yields = 0
         # Set once progress_func declines, modeling the core honoring the abort.
         self.constant_scan_aborted: bool | None = None
@@ -255,6 +270,17 @@ class FakeBinaryView:
 
     def get_functions_containing(self, address: int) -> list[FakeFunction]:
         return [f for f in self.functions if f.start <= address < f.end]
+
+    def get_symbols(self, start: int | None = None, length: int | None = None) -> list[FakeSymbol]:
+        """Mirror BinaryView.get_symbols(start, length): address in [start, start+length)."""
+        if start is None:
+            return list(self._symbols)
+        end = start + length if length is not None else None
+        return [
+            symbol
+            for symbol in self._symbols
+            if start <= symbol.address and (end is None or symbol.address < end)
+        ]
 
     def get_string_at(self, address: int) -> object:
         for string in self.strings:

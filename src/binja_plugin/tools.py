@@ -7,11 +7,15 @@ Handlers run on the MCP server thread, so none of them touch the UI thread direc
 from __future__ import annotations
 
 import contextlib
+import csv
 import io
+import json
 import re
 from collections import deque
+from collections.abc import Callable
 from itertools import islice
-from typing import Annotated, Literal
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 import binaryninja
 from binaryninja import mcp
@@ -44,9 +48,31 @@ _MAX_STRING_READ_CHARS = 4096
 # Raw pattern-string cap for rex_data_find: bounds the regex compile and the per-chunk
 # read inflation (read_size grows with the pattern length) before any of that happens.
 _MAX_PATTERN_CHARS = 8192
+# rex_disasm_at window sizes: bounded so one call can never request an unbounded
+# instruction render, whatever the containing function's size.
+_MAX_DISASM_CONTEXT = 64
+# rex_hlil_grep per-match context: bounded so the three-matches-per-function cap keeps
+# the echoed lines per function a few dozen at most.
+_MAX_HLIL_GREP_CONTEXT = 8
+# rex_decompile_many caps: 16 address expressions bound one call's decompilation cost,
+# and 400 lines bound the echoed text per function.
+_MAX_DECOMPILE_BATCH = 16
+_MAX_DECOMPILE_LINES = 400
+# rex_find_functions_by_pattern example matches per function: triage wants a handful of
+# hit addresses; rex_data_find already returns full match lists.
+_MAX_FIND_FUNCTIONS_EXAMPLES = 5
+# rex_export_* tools: sweeps write to one fixed directory and echo only a summary, so a
+# large export can never flood the MCP response. The byte cap bounds each file; the
+# window caps bound how much a single call selects before serialization.
+_EXPORT_ROOT = Path.home() / ".binaryninja" / "exports"
+_MAX_EXPORT_COMPONENT_BYTES = 255
+_MAX_EXPORT_FILE_BYTES = 4 * 1024 * 1024
+_MAX_EXPORT_DISASM_LINES = 400
+_MAX_EXPORT_SYMBOLS = 2000
 _METADATA_PREFIX = "rex/"
 _TAG_ICON = "\u25c6"
 _STRING_TYPES = Literal["AsciiString", "Utf16String", "Utf32String", "Utf8String"]
+_EXPORT_FORMATS = Literal["csv", "json"]
 
 
 def _validate_range(name: str, value: int, minimum: int, maximum: int | None = None) -> int:
@@ -107,6 +133,109 @@ def _require_function(bv: BinaryView, address: int) -> Function:
 
 def _function_entry(function: Function) -> dict[str, object]:
     return {"start": hex(function.start), "name": _truncate(function.name)}
+
+
+def _render_function_disassembly(function: Any) -> list[tuple[int, str]]:
+    """Render a function's addressed disassembly lines, sorted by address.
+
+    Shared by rex_disasm_at and rex_export_disasm so both tools see exactly the same
+    render. The parameter is Any-typed: the function comes back from the Any-typed
+    binary view handle, and the stubbed Function type does not model basic_blocks.
+    """
+    lines: list[tuple[int, str]] = []
+    for block in function.basic_blocks:
+        for line in block.get_disassembly_text():
+            # Unaddressed continuation lines cannot anchor or be reported by address.
+            if line.address is None:
+                continue
+            lines.append((line.address, "".join(str(token) for token in line.tokens)))
+    lines.sort(key=lambda entry: entry[0])
+    return lines
+
+
+def _disasm_window(
+    lines: list[tuple[int, str]], address: int, before: int, after: int
+) -> tuple[int, int]:
+    """Return the [start, end) slice of ``lines`` for the before/after window at ``address``."""
+    # The anchor is the last line at or before the address: at a shared address that is
+    # the labeled instruction rather than the label, and past the last instruction it is
+    # the final rendered line.
+    anchor = 0
+    for index, (line_address, _) in enumerate(lines):
+        if line_address > address:
+            break
+        anchor = index
+    start = max(0, anchor - before)
+    end = min(len(lines), anchor + 1 + after)
+    return start, end
+
+
+def _validate_export_path(filename: str) -> None:
+    """Reject filenames that could escape or abuse the export root.
+
+    Pure lexical validation: no filesystem access, just the checks a plain file name must
+    pass before it is joined with the export root.
+    """
+    if not filename:
+        raise mcp.ToolError("invalid_params", "filename must not be empty")
+    if filename.startswith("/"):
+        raise mcp.ToolError(
+            "invalid_params", "filename must be a plain file name, not an absolute path"
+        )
+    if "\\" in filename:
+        raise mcp.ToolError("invalid_params", "filename must not contain backslashes")
+    if "\x00" in filename:
+        raise mcp.ToolError("invalid_params", "filename must not contain NUL bytes")
+    parts = filename.split("/")
+    if ".." in parts:
+        raise mcp.ToolError("invalid_params", "filename must not contain '..' path components")
+    for part in parts:
+        if len(part.encode("utf-8")) > _MAX_EXPORT_COMPONENT_BYTES:
+            # NAME_MAX applies per component, not to the joined path.
+            raise mcp.ToolError(
+                "invalid_params",
+                f"filename component exceeds {_MAX_EXPORT_COMPONENT_BYTES} bytes",
+            )
+
+
+def _resolve_export_path(filename: str) -> Path:
+    """Join an already-validated filename with the export root and resolve it."""
+    try:
+        _EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+        return (_EXPORT_ROOT / filename).resolve()
+    except (OSError, ValueError) as error:
+        raise mcp.ToolError("export_failed", f"could not prepare export path: {error}") from None
+
+
+def _write_export_file(path: Path, text: str) -> int:
+    """Write UTF-8 text to an export file, returning the encoded byte count."""
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+    except (OSError, ValueError) as error:
+        raise mcp.ToolError("export_failed", f"could not write export file: {error}") from None
+    return len(text.encode("utf-8"))
+
+
+def _fit_to_export_cap[ExportRow](
+    serialize: Callable[[list[ExportRow]], str], window: list[ExportRow]
+) -> tuple[str, bool]:
+    """Serialize a result window, dropping trailing entries until it fits the byte cap.
+
+    Returns the text and whether entries were dropped for size. Dropping always
+    terminates at a fitting window because a window holding only its first entry is
+    checked up front: when even that overflows the cap, no export is possible and the
+    call is rejected instead of silently writing a near-empty file.
+    """
+    if window and len(serialize(window[:1]).encode("utf-8")) > _MAX_EXPORT_FILE_BYTES:
+        raise mcp.ToolError("export_failed", "first entry exceeds the export byte cap")
+    dropped = False
+    while True:
+        text = serialize(window)
+        if len(text.encode("utf-8")) <= _MAX_EXPORT_FILE_BYTES:
+            return text, dropped
+        del window[-1]
+        dropped = True
 
 
 @mcp.tool(read_only=True)
@@ -297,6 +426,104 @@ def rex_data_find(
     return {"total": total, "truncated": truncated, "matches": matches}
 
 
+@mcp.tool(read_only=True)
+def rex_decompile_many(
+    call: mcp.ToolCall,
+    functions: list[str],
+    max_lines: Annotated[int, mcp.Minimum(1), mcp.Maximum(_MAX_DECOMPILE_LINES)] = 200,
+) -> dict[str, object]:
+    """Batch decompilation for triage.
+
+    Renders the HLIL of up to 16 functions in one call. Every address expression is
+    resolved and checked against the analyzed functions before anything is rendered, so
+    one invalid or unanalyzed entry rejects the whole call: a result is always complete
+    or absent, never partial. HLIL rendering costs tens of milliseconds per function the
+    first time, which is what the batch cap bounds.
+
+    :param functions: Address expressions of the functions to render, in output order;
+        1 to 16 entries.
+    :param max_lines: HLIL lines to render per function (1 to 400).
+    """
+    bv = call.binary_view
+    max_lines = _validate_range("max_lines", max_lines, 1, _MAX_DECOMPILE_LINES)
+    if not isinstance(functions, list):
+        raise mcp.ToolError("invalid_params", "functions must be a list of address expressions")
+    if not 1 <= len(functions) <= _MAX_DECOMPILE_BATCH:
+        raise mcp.ToolError(
+            "invalid_params",
+            f"functions must contain between 1 and {_MAX_DECOMPILE_BATCH} address expressions",
+        )
+    # Resolve and check every entry before rendering anything, so a bad entry anywhere
+    # in the batch cannot leave a partial result behind.
+    resolved: list[Function] = []
+    for index, entry in enumerate(functions):
+        if not isinstance(entry, str):
+            raise mcp.ToolError(
+                "invalid_params", f"functions[{index}] must be a string address expression"
+            )
+        try:
+            address = call.parse_address(entry)
+        except Exception as error:
+            raise mcp.ToolError(
+                "invalid_params", f"bad address expression '{_truncate(entry)}': {error}"
+            ) from None
+        found = bv.get_functions_containing(address)
+        if not found:
+            raise mcp.ToolError("invalid_params", f"no analyzed function contains {address:#x}")
+        resolved.append(found[0])
+    rendered: list[dict[str, object]] = []
+    for function in resolved:
+        hlil = function.hlil
+        source_lines = str(hlil).splitlines() if hlil is not None else []
+        rendered.append(
+            {
+                **_function_entry(function),
+                "lines": [_truncate(line) for line in source_lines[:max_lines]],
+                "truncated": len(source_lines) > max_lines,
+            }
+        )
+    return {"functions": rendered}
+
+
+@mcp.tool(read_only=True)
+def rex_disasm_at(
+    call: mcp.ToolCall,
+    address: mcp.Address,
+    before: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_DISASM_CONTEXT)] = 4,
+    after: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_DISASM_CONTEXT)] = 8,
+) -> dict[str, object]:
+    """Address-anchored disassembly window.
+
+    The window is anchored at the instruction containing ``address`` and clipped at the
+    edges of the containing function: fewer instructions coming back means the function
+    ends there, not an error. An address outside every analyzed function is rejected
+    rather than snapped to the nearest one. The call renders the containing function's
+    disassembly once, so the cost scales with that function.
+
+    :param address: Address expression inside the target function; accepts hex like
+        0x401000, symbols, and Binary Ninja expressions.
+    :param before: Instructions to include before the anchor (0 to 64).
+    :param after: Instructions to include after the anchor (0 to 64).
+    """
+    bv = call.binary_view
+    before = _validate_range("before", before, 0, _MAX_DISASM_CONTEXT)
+    after = _validate_range("after", after, 0, _MAX_DISASM_CONTEXT)
+    functions = bv.get_functions_containing(address)
+    if not functions:
+        raise mcp.ToolError("invalid_params", f"no analyzed function contains {address:#x}")
+    function = functions[0]
+    lines = _render_function_disassembly(function)
+    start, end = _disasm_window(lines, address, before, after)
+    return {
+        "function": _function_entry(function),
+        "instructions": [
+            {"address": hex(line_address), "text": _truncate(text)}
+            for line_address, text in lines[start:end]
+        ],
+        "truncated": start > 0 or end < len(lines),
+    }
+
+
 @mcp.tool(destructive=True)
 def rex_eval_python(call: mcp.ToolCall, code: str) -> dict[str, object]:
     """Run trusted Python against the Binary Ninja API with the active view exposed as bv.
@@ -350,6 +577,234 @@ def rex_eval_python(call: mcp.ToolCall, code: str) -> dict[str, object]:
     }
 
 
+@mcp.tool()
+def rex_export_disasm(
+    call: mcp.ToolCall,
+    address: mcp.Address,
+    before: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_DISASM_CONTEXT)] = 4,
+    after: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_DISASM_CONTEXT)] = 8,
+    max_lines: Annotated[int, mcp.Minimum(1), mcp.Maximum(_MAX_EXPORT_DISASM_LINES)] = 200,
+    filename: str = "",
+) -> dict[str, object]:
+    """Export one analyzed function's disassembly window to a file.
+
+    Anti-flood export: the rendered lines are written to disk and the response echoes
+    only ``path``, ``bytes_written``, ``lines`` and ``truncated`` — never the
+    disassembly text itself, so a large sweep cannot flood the MCP response. Address
+    handling matches rex_disasm_at exactly: the window is anchored at the instruction
+    containing ``address``, clipped at the containing function's edges, and an address
+    outside every analyzed function is rejected rather than snapped to the nearest one.
+
+    Accepted cost: the render materializes the whole function's disassembly lines in
+    memory before the ``max_lines`` cap and the export byte cap apply — the same cost
+    class as the existing echo tools. Each file line is the rendered instruction text
+    (the ``text`` field rex_disasm_at echoes), one instruction per line, LF endings.
+    ``truncated`` is true unless the file holds every rendered addressed line of the
+    containing function: lines were left out by the before/after window, ``max_lines``,
+    or the byte cap.
+
+    :param address: Address expression inside the target function; accepts hex like
+        0x401000, symbols, and Binary Ninja expressions.
+    :param before: Instructions to include before the anchor (0 to 64).
+    :param after: Instructions to include after the anchor (0 to 64).
+    :param max_lines: Maximum number of lines to export (1 to 400).
+    :param filename: Plain file name inside the export root; overwritten if it exists.
+    """
+    bv = call.binary_view
+    before = _validate_range("before", before, 0, _MAX_DISASM_CONTEXT)
+    after = _validate_range("after", after, 0, _MAX_DISASM_CONTEXT)
+    max_lines = _validate_range("max_lines", max_lines, 1, _MAX_EXPORT_DISASM_LINES)
+    _validate_export_path(filename)
+    functions = bv.get_functions_containing(address)
+    if not functions:
+        raise mcp.ToolError("invalid_params", f"no analyzed function contains {address:#x}")
+    lines = _render_function_disassembly(functions[0])
+    start, end = _disasm_window(lines, address, before, after)
+    window = lines[start:end][:max_lines]
+
+    def serialize(selected: list[tuple[int, str]]) -> str:
+        return "".join(f"{text}\n" for _, text in selected)
+
+    text, dropped = _fit_to_export_cap(serialize, window)
+    resolved = _resolve_export_path(filename)
+    return {
+        "path": str(resolved),
+        "bytes_written": _write_export_file(resolved, text),
+        "lines": len(window),
+        "truncated": len(window) < len(lines) or dropped,
+    }
+
+
+@mcp.tool()
+def rex_export_symbols(
+    call: mcp.ToolCall,
+    start: Annotated[int, mcp.Minimum(0)],
+    end: int,
+    limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_EXPORT_SYMBOLS)] = 500,
+    offset: Annotated[int, mcp.Minimum(0)] = 0,
+    format: _EXPORT_FORMATS = "csv",
+    filename: str = "",
+) -> dict[str, object]:
+    """Export the symbols in an address range to a file.
+
+    Anti-flood export: symbols are written to disk and the response echoes only
+    ``path``, ``bytes_written``, ``rows``, ``total`` and ``truncated`` — never the
+    symbol table itself. Symbols come from the core's range query
+    (``bv.get_symbols(start, length)``), are sorted by address ascending, and ``total``
+    is the exact count in ``[start, end)``; the window is ``offset`` to
+    ``offset + limit`` of that sorted list.
+
+    The sort-then-slice here is a deliberate divergence from the early-stop pagination
+    of the string search tools: an export file must contain the true window of the
+    sorted listing, not an unsorted first-fit subset, and the range query already bounds
+    the enumeration cost.
+
+    CSV rows are ``symbol_address,symbol_type,name`` with commas in names quoted by the
+    csv module; JSON is an indented array of the window's rows. Both are written UTF-8
+    with LF endings. ``truncated`` is true when the window was clipped by
+    ``offset``/``limit`` or when rows were dropped from its end to fit the export byte
+    cap.
+
+    :param start: Start of the address range (inclusive, >= 0).
+    :param end: End of the address range (exclusive); must be greater than ``start``.
+    :param limit: Maximum number of symbols to export (0 to 2000).
+    :param offset: Number of sorted symbols to skip before the window starts (>= 0).
+    :param format: Output format, "csv" or "json".
+    :param filename: Plain file name inside the export root; overwritten if it exists.
+    """
+    bv = call.binary_view
+    limit = _validate_range("limit", limit, 0, _MAX_EXPORT_SYMBOLS)
+    offset = _validate_range("offset", offset, 0)
+    start = _validate_range("start", start, 0)
+    if start >= end:
+        raise mcp.ToolError("invalid_params", "end must be greater than start")
+    _validate_export_path(filename)
+    # The schema-side Literal and the body-side check below must agree; widening to str
+    # keeps the body check statically reachable for direct handler invocation.
+    requested: str = format
+    if requested not in ("csv", "json"):
+        raise mcp.ToolError("invalid_params", f"format must be 'csv' or 'json', not '{requested}'")
+    symbols = bv.get_symbols(start, end - start)
+    # Core symbol order is not guaranteed sorted; sort before slicing so the file holds
+    # a true window of the address-ordered listing (see the docstring above).
+    ordered = sorted(symbols, key=lambda symbol: symbol.address)
+    total = len(ordered)
+    window = [
+        (symbol.address, symbol.type.name, symbol.name)
+        for symbol in ordered[offset : offset + limit]
+    ]
+
+    def serialize(rows: list[tuple[int, str, str]]) -> str:
+        if requested == "csv":
+            buffer = io.StringIO()
+            writer = csv.writer(buffer, lineterminator="\n")
+            writer.writerow(["symbol_address", "symbol_type", "name"])
+            for address, symbol_type, name in rows:
+                writer.writerow([hex(address), symbol_type, name])
+            return buffer.getvalue()
+        return json.dumps(
+            [
+                {"symbol_address": hex(address), "symbol_type": symbol_type, "name": name}
+                for address, symbol_type, name in rows
+            ],
+            indent=2,
+        )
+
+    text, dropped = _fit_to_export_cap(serialize, window)
+    resolved = _resolve_export_path(filename)
+    return {
+        "path": str(resolved),
+        "bytes_written": _write_export_file(resolved, text),
+        "rows": len(window),
+        "truncated": offset + limit < total or dropped,
+        "total": total,
+    }
+
+
+@mcp.tool(read_only=True)
+def rex_find_functions_by_pattern(
+    call: mcp.ToolCall,
+    pattern: str,
+    limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_LIMIT)] = 50,
+    offset: Annotated[int, mcp.Minimum(0)] = 0,
+) -> dict[str, object]:
+    """Which functions contain a byte pattern.
+
+    Scans mapped memory rex_data_find-style (chunked reads overlapping by
+    pattern_length - 1, so straddling matches are found exactly once) and maps every
+    match to the analyzed function containing it. Matches in data or in gaps between
+    functions are ignored. Functions are reported in first-match order with a true
+    match count and up to 5 example addresses; an empty result is a valid empty list,
+    not an error. Like rex_data_find, the scan stops at the first function past the
+    requested window, so when ``truncated`` is true the counts near the end of the
+    result can be incomplete.
+
+    :param pattern: Hex byte pattern, e.g. "48 8b ?? 05"; "??" matches any single byte.
+    :param limit: Maximum number of matching functions to return (0 to 500).
+    :param offset: Number of matching functions to skip before collecting results (>= 0).
+    """
+    bv = call.binary_view
+    limit = _validate_range("limit", limit, 0, _MAX_LIMIT)
+    offset = _validate_range("offset", offset, 0)
+    if len(pattern) > _MAX_PATTERN_CHARS:
+        raise mcp.ToolError("pattern_too_large", f"pattern exceeds {_MAX_PATTERN_CHARS} characters")
+    try:
+        matcher, pattern_length = compile_hex_pattern(pattern)
+    except HexPatternError as exc:
+        raise mcp.ToolError("invalid_pattern", str(exc)) from None
+    # Per-function state lives in plain typed dicts rather than in mutable dict entries:
+    # counts are accumulated per match and the entries are assembled once at the end.
+    starts: list[int] = []
+    names: dict[int, str] = {}
+    match_counts: dict[int, int] = {}
+    examples: dict[int, list[str]] = {}
+    matched_functions = 0
+    truncated = False
+    for segment in bv.segments:
+        position = segment.start
+        segment_end = segment.start + segment.length
+        while position < segment_end:
+            read_size = min(_READ_CHUNK + pattern_length - 1, segment_end - position)
+            chunk = bv.read(position, read_size)
+            if chunk:
+                for match in matcher.finditer(chunk):
+                    address = position + match.start()
+                    containing = bv.get_functions_containing(address)
+                    if not containing:
+                        continue
+                    function = containing[0]
+                    if function.start not in match_counts:
+                        matched_functions += 1
+                        if matched_functions > offset + limit:
+                            # The first matching function past the window proves more
+                            # exist; stop the scan there instead of counting the rest.
+                            truncated = True
+                            break
+                        starts.append(function.start)
+                        names[function.start] = _truncate(function.name)
+                        match_counts[function.start] = 0
+                        examples[function.start] = []
+                    match_counts[function.start] += 1
+                    shown = examples[function.start]
+                    if len(shown) < _MAX_FIND_FUNCTIONS_EXAMPLES:
+                        shown.append(hex(address))
+                if truncated:
+                    break
+            position += _READ_CHUNK
+        if truncated:
+            break
+    functions = [
+        {
+            "start": hex(start),
+            "name": names[start],
+            "match_count": match_counts[start],
+            "addresses": examples[start],
+        }
+        for start in starts[offset:]
+    ]
+    return {"truncated": truncated, "functions": functions}
+
+
 @mcp.tool(read_only=True)
 def rex_function_containing(call: mcp.ToolCall, addr: mcp.Address) -> dict[str, object]:
     """List the functions that contain an address.
@@ -396,12 +851,20 @@ def rex_hlil_grep(
     limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_LIMIT)] = 20,
     max_functions: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_FUNCTIONS)] = 2000,
     offset: Annotated[int, mcp.Minimum(0)] = 0,
+    context_before: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_CONTEXT)] = 0,
+    context_after: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_CONTEXT)] = 0,
 ) -> dict[str, object]:
     """Search rendered HLIL text across functions with a regular expression.
 
     Regular expressions run on Python's ``re`` with no timeout, so a pattern with
     catastrophic backtracking can stall the scan. Each function reports at most the
     first 3 matching HLIL lines.
+
+    With ``context_before``/``context_after`` each match comes back wrapped in that
+    many surrounding HLIL lines: the matched line is prefixed with ``"> "`` and the
+    context lines with two spaces, and consecutive windows are separated by ``"--"`` so
+    overlapping context ranges stay unambiguous. Function edges truncate the window;
+    the caps on matches per function and on echoed line length are unchanged.
 
     Rendering HLIL is the dominant cost: tens of milliseconds per function the first
     time a function's HLIL is generated. A single invocation never renders more than
@@ -413,11 +876,15 @@ def rex_hlil_grep(
     :param limit: Maximum number of matching functions to return (0 to 200).
     :param max_functions: Maximum number of functions to scan before stopping (0 to 5000).
     :param offset: Number of functions to skip before scanning starts (>= 0).
+    :param context_before: HLIL lines to include before each match (0 to 8).
+    :param context_after: HLIL lines to include after each match (0 to 8).
     """
     bv = call.binary_view
     limit = _validate_range("limit", limit, 0, _MAX_HLIL_GREP_LIMIT)
     max_functions = _validate_range("max_functions", max_functions, 0, _MAX_HLIL_GREP_FUNCTIONS)
     offset = _validate_range("offset", offset, 0)
+    context_before = _validate_range("context_before", context_before, 0, _MAX_HLIL_GREP_CONTEXT)
+    context_after = _validate_range("context_after", context_after, 0, _MAX_HLIL_GREP_CONTEXT)
     matcher = _compile_user_regex(regex)
     name_matcher = _name_filter(function_filter)
     matches: list[dict[str, object]] = []
@@ -435,13 +902,32 @@ def rex_hlil_grep(
         if hlil is None:
             continue
         scanned += 1
-        lines = [line for line in str(hlil).splitlines() if matcher.search(line)]
-        if lines:
+        source_lines = str(hlil).splitlines()
+        matched = [
+            line_index for line_index, line in enumerate(source_lines) if matcher.search(line)
+        ]
+        if matched:
+            if context_before == 0 and context_after == 0:
+                lines = [_truncate(source_lines[match_index]) for match_index in matched[:3]]
+            else:
+                lines = []
+                for match_index in matched[:3]:
+                    if lines:
+                        # Keep windows apart even when their context ranges overlap, so
+                        # each match's own before/after group stays identifiable.
+                        lines.append("--")
+                    start = max(0, match_index - context_before)
+                    lines.extend("  " + _truncate(line) for line in source_lines[start:match_index])
+                    lines.append("> " + _truncate(source_lines[match_index]))
+                    end = match_index + 1 + context_after
+                    lines.extend(
+                        "  " + _truncate(line) for line in source_lines[match_index + 1 : end]
+                    )
             matches.append(
                 {
                     "start": hex(function.start),
                     "name": _truncate(function.name),
-                    "lines": [_truncate(line) for line in lines[:3]],
+                    "lines": lines,
                 }
             )
     return {

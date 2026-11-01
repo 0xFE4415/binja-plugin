@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from helpers import (
     FakeBinaryView,
     FakeFunction,
     FakeSegment,
     FakeStringReference,
+    FakeSymbol,
     FakeToolCall,
     FakeToolError,
     RenderableText,
@@ -266,6 +269,202 @@ def test_data_find_skips_unreadable_segments() -> None:
     assert find(_call(view), pattern="ff")["total"] == 0
 
 
+class FakeDisassemblyLine:
+    """Mirrors the DisassemblyTextLine fields rex_disasm_at reads."""
+
+    def __init__(self, address: int | None, text: str) -> None:
+        self.address = address
+        self.tokens = [text]
+
+
+class FakeBasicBlock:
+    def __init__(self, lines: list[tuple[int | None, str]]) -> None:
+        self._lines = lines
+
+    def get_disassembly_text(self) -> list[FakeDisassemblyLine]:
+        return [FakeDisassemblyLine(address, text) for address, text in self._lines]
+
+
+class FakeDisasmFunction(FakeFunction):
+    """FakeFunction with the basic_blocks attribute rex_disasm_at reads."""
+
+    def __init__(
+        self,
+        name: str,
+        start: int,
+        end: int,
+        blocks: list[FakeBasicBlock],
+        hlil: object = None,
+    ) -> None:
+        super().__init__(name, start, end, hlil=hlil)
+        self.basic_blocks = blocks
+
+
+def _disasm_view() -> FakeBinaryView:
+    main = FakeDisasmFunction(
+        "main",
+        0x1100,
+        0x1200,
+        blocks=[
+            FakeBasicBlock(
+                [
+                    (0x1100, "push rbp"),
+                    (0x1101, "mov rbp, rsp"),
+                    (0x1104, "sub rsp, 0x20"),
+                    (0x1108, "mov eax, 1"),
+                    (0x110D, "leave"),
+                    (0x110E, "ret"),
+                ]
+            )
+        ],
+    )
+    handler = FakeDisasmFunction(
+        "handler", 0x2000, 0x2100, blocks=[FakeBasicBlock([(0x2000, "push rbp"), (0x2001, "ret")])]
+    )
+    return FakeBinaryView(functions=[main, handler])
+
+
+def test_disasm_at_returns_function_and_window() -> None:
+    view = _disasm_view()
+    _, disasm = get_tool("rex_disasm_at")
+    result = disasm(_call(view), 0x1104)
+    assert result == {
+        "function": {"start": "0x1100", "name": "main"},
+        "instructions": [
+            {"address": "0x1100", "text": "push rbp"},
+            {"address": "0x1101", "text": "mov rbp, rsp"},
+            {"address": "0x1104", "text": "sub rsp, 0x20"},
+            {"address": "0x1108", "text": "mov eax, 1"},
+            {"address": "0x110d", "text": "leave"},
+            {"address": "0x110e", "text": "ret"},
+        ],
+        "truncated": False,
+    }
+
+
+def test_disasm_at_truncates_at_function_edges() -> None:
+    view = _disasm_view()
+    _, disasm = get_tool("rex_disasm_at")
+    # "before" reaching past the first line just starts the window at the function start,
+    # and the truncation flag says the head was clipped, not that anything failed.
+    head = disasm(_call(view), 0x1101, before=4, after=1)
+    assert [entry["address"] for entry in head["instructions"]] == ["0x1100", "0x1101", "0x1104"]
+    assert head["truncated"] is True
+    tail = disasm(_call(view), 0x110D, before=1, after=8)
+    assert [entry["address"] for entry in tail["instructions"]] == ["0x1108", "0x110d", "0x110e"]
+    assert tail["truncated"] is True
+
+
+def test_disasm_at_anchors_inside_the_containing_instruction() -> None:
+    view = _disasm_view()
+    _, disasm = get_tool("rex_disasm_at")
+    # 0x1105 falls inside "sub rsp, 0x20" (0x1104): the anchor moves down to its start.
+    inside = disasm(_call(view), 0x1105, before=0, after=0)
+    assert inside["instructions"] == [{"address": "0x1104", "text": "sub rsp, 0x20"}]
+    assert inside["truncated"] is True
+    # An address in the function's range but past the last rendered line anchors at the
+    # last line instead of failing.
+    past = disasm(_call(view), 0x1150, before=1, after=0)
+    assert [entry["address"] for entry in past["instructions"]] == ["0x110d", "0x110e"]
+
+
+def test_disasm_at_anchors_past_label_lines() -> None:
+    # A label line shares the anchor's address with the instruction it names; the
+    # instruction wins the anchor, and the label only shows up inside the window.
+    main = FakeDisasmFunction(
+        "main",
+        0x1100,
+        0x1200,
+        blocks=[FakeBasicBlock([(0x1100, "loc_1100:"), (0x1100, "push rbp"), (0x1101, "ret")])],
+    )
+    view = FakeBinaryView(functions=[main])
+    _, disasm = get_tool("rex_disasm_at")
+    result = disasm(_call(view), 0x1100, before=0, after=1)
+    assert result["instructions"] == [
+        {"address": "0x1100", "text": "push rbp"},
+        {"address": "0x1101", "text": "ret"},
+    ]
+    assert result["truncated"] is True
+
+
+def test_disasm_at_skips_unaddressed_lines() -> None:
+    # Renderings can emit unaddressed continuation lines (a None address): they can
+    # neither anchor nor be reported, so only addressed lines reach the window.
+    main = FakeDisasmFunction(
+        "main",
+        0x1100,
+        0x1200,
+        blocks=[FakeBasicBlock([(0x1100, "push rbp"), (None, "..."), (0x1101, "ret")])],
+    )
+    view = FakeBinaryView(functions=[main])
+    _, disasm = get_tool("rex_disasm_at")
+    result = disasm(_call(view), 0x1100, before=0, after=1)
+    assert result["instructions"] == [
+        {"address": "0x1100", "text": "push rbp"},
+        {"address": "0x1101", "text": "ret"},
+    ]
+    assert result["truncated"] is False
+
+
+def test_disasm_at_rejects_addresses_outside_functions() -> None:
+    view = _disasm_view()
+    _, disasm = get_tool("rex_disasm_at")
+    # The gap between the two functions, an address before the first one, and one past
+    # the last are all rejected outright, never snapped to a neighboring function.
+    for address in (0x1800, 0x150, 0x9000):
+        with pytest.raises(FakeToolError) as exc:
+            disasm(_call(view), address)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == f"no analyzed function contains {address:#x}"
+
+
+def test_disasm_at_rejects_out_of_range_window() -> None:
+    view = _disasm_view()
+    _, disasm = get_tool("rex_disasm_at")
+    # Zero and the cap are inclusive; one past the cap is rejected, not clamped down.
+    capped = disasm(_call(view), 0x1104, before=0, after=tools._MAX_DISASM_CONTEXT)
+    assert [entry["address"] for entry in capped["instructions"]] == [
+        "0x1104",
+        "0x1108",
+        "0x110d",
+        "0x110e",
+    ]
+    assert capped["truncated"] is True
+    for kwargs, message in (
+        ({"before": -1}, "Invalid integer parameter 'before': Must be at least 0"),
+        ({"after": -1}, "Invalid integer parameter 'after': Must be at least 0"),
+        (
+            {"before": tools._MAX_DISASM_CONTEXT + 1},
+            f"Invalid integer parameter 'before': Must be at most {tools._MAX_DISASM_CONTEXT}",
+        ),
+        (
+            {"after": tools._MAX_DISASM_CONTEXT + 1},
+            f"Invalid integer parameter 'after': Must be at most {tools._MAX_DISASM_CONTEXT}",
+        ),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            disasm(_call(view), 0x1104, **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+    # Window sizes are validated before the address is even looked up: on a view with no
+    # functions the range error wins over the no-function error.
+    with pytest.raises(FakeToolError) as exc:
+        disasm(_call(FakeBinaryView()), 0x1104, before=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'before': Must be at least 0"
+
+
+def test_disasm_at_truncates_names_and_text() -> None:
+    main = FakeDisasmFunction(
+        "m" * 600, 0x1100, 0x1200, blocks=[FakeBasicBlock([(0x1100, "x" * 600)])]
+    )
+    view = FakeBinaryView(functions=[main])
+    _, disasm = get_tool("rex_disasm_at")
+    result = disasm(_call(view), 0x1100, before=0, after=0)
+    assert result["function"]["name"].endswith("chars truncated]")
+    assert result["instructions"][0]["text"].endswith("chars truncated]")
+
+
 def _constant_view() -> FakeBinaryView:
     functions = [
         FakeFunction("main", 0x1100, 0x1200),
@@ -475,6 +674,92 @@ def test_hlil_grep_caps_lines_per_function() -> None:
         ],
         "next_offset": None,
     }
+
+
+def test_hlil_grep_context_wraps_matches() -> None:
+    view = _view_with_functions()
+    _, grep = get_tool("rex_hlil_grep")
+    # Context lines are prefixed with two spaces and the matched line with "> ", so the
+    # match stays delimited inside its window.
+    result = grep(_call(view), "recv", context_before=1, context_after=1)
+    assert result["functions"] == [
+        {
+            "start": "0x1100",
+            "name": "main",
+            "lines": [
+                "  void main() {",
+                ">     if (recv(fd, buf, n) <= 0)",
+                "          return 1;",
+            ],
+        }
+    ]
+    # Function edges truncate: the first HLIL line has no predecessor, so a larger
+    # before-context returns fewer lines rather than padding.
+    clipped = grep(_call(view), "recv", context_before=8, context_after=8)
+    assert clipped["functions"][0]["lines"] == [
+        "  void main() {",
+        ">     if (recv(fd, buf, n) <= 0)",
+        "          return 1;",
+        "  }",
+    ]
+    # Explicit zero on both sides must stay byte-identical to the undecorated form.
+    assert grep(_call(view), "recv", context_before=0, context_after=0) == grep(_call(view), "recv")
+
+
+def test_hlil_grep_context_separates_and_caps_matches() -> None:
+    lines = "\n".join(f"call rax_{index}" for index in range(4))
+    view = FakeBinaryView(
+        functions=[FakeFunction("f", 0x1000, 0x1010, hlil=RenderableText(lines + "\n"))]
+    )
+    _, grep = get_tool("rex_hlil_grep")
+    result = grep(_call(view), "call rax", context_before=1)
+    # Three matches is still the per-function cap; each match keeps its own window, and
+    # "--" separates consecutive groups even where their context ranges overlap.
+    assert result["functions"][0]["lines"] == [
+        "> call rax_0",
+        "--",
+        "  call rax_0",
+        "> call rax_1",
+        "--",
+        "  call rax_1",
+        "> call rax_2",
+    ]
+
+
+def test_hlil_grep_context_truncates_long_lines() -> None:
+    hlil = RenderableText("before\n" + "a" * 600 + "\nrecv()\nafter")
+    view = FakeBinaryView(functions=[FakeFunction("f", 0x1000, 0x1010, hlil=hlil)])
+    _, grep = get_tool("rex_hlil_grep")
+    # Context lines go through the same per-line echo cap as matched lines.
+    result = grep(_call(view), "recv", context_before=2)
+    assert result["functions"][0]["lines"] == [
+        "  before",
+        "  " + "a" * tools._MAX_CHARS + "... [88 chars truncated]",
+        "> recv()",
+    ]
+
+
+def test_hlil_grep_rejects_out_of_range_context() -> None:
+    view = _view_with_functions()
+    _, grep = get_tool("rex_hlil_grep")
+    for kwargs, message in (
+        ({"context_before": -1}, "Invalid integer parameter 'context_before': Must be at least 0"),
+        ({"context_after": -1}, "Invalid integer parameter 'context_after': Must be at least 0"),
+        (
+            {"context_before": tools._MAX_HLIL_GREP_CONTEXT + 1},
+            "Invalid integer parameter 'context_before': Must be at most "
+            f"{tools._MAX_HLIL_GREP_CONTEXT}",
+        ),
+        (
+            {"context_after": tools._MAX_HLIL_GREP_CONTEXT + 1},
+            "Invalid integer parameter 'context_after': Must be at most "
+            f"{tools._MAX_HLIL_GREP_CONTEXT}",
+        ),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            grep(_call(view), "recv", **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
 
 
 def test_hlil_grep_limits_and_errors() -> None:
@@ -1174,3 +1459,707 @@ def test_search_tools_report_empty_results_on_an_empty_view() -> None:
     with pytest.raises(FakeToolError) as exc:
         containing(_call(view), 0x1000)
     assert exc.value.code == "no_function"
+
+
+class FakeParsingToolCall(FakeToolCall):
+    """FakeToolCall with the parse_address surface rex_decompile_many reads.
+
+    Deliberately raises a plain ValueError for unparsable input instead of a ToolError:
+    the handler owns the conversion of expression-parse failures to invalid_params, so
+    the fake must not hand it an error to pass through.
+    """
+
+    def parse_address(self, value: object, here: int = 0) -> int:
+        text = value if isinstance(value, str) else str(value)
+        try:
+            return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+        except ValueError:
+            raise ValueError(f"unparsable address expression '{text}'") from None
+
+
+def _decompile_view() -> FakeBinaryView:
+    main = FakeFunction(
+        "main", 0x1100, 0x1200, hlil=RenderableText("void main() {\n    return 0;\n}")
+    )
+    handler = FakeFunction(
+        "handler",
+        0x2000,
+        0x2100,
+        hlil=RenderableText("void handler() {\n    recv(fd, buf, n);\n    return 1;\n}"),
+    )
+    # "sink" models a function that was never lifted: it contains addresses but has no HLIL.
+    sink = FakeFunction("sink", 0x3000, 0x3100)
+    return FakeBinaryView(functions=[main, handler, sink])
+
+
+def test_decompile_many_renders_each_requested_function() -> None:
+    view = _decompile_view()
+    _, decompile = get_tool("rex_decompile_many")
+    result = decompile(FakeParsingToolCall(view), ["0x1100", "0x2000"], max_lines=400)
+    assert result == {
+        "functions": [
+            {
+                "start": "0x1100",
+                "name": "main",
+                "lines": ["void main() {", "    return 0;", "}"],
+                "truncated": False,
+            },
+            {
+                "start": "0x2000",
+                "name": "handler",
+                "lines": ["void handler() {", "    recv(fd, buf, n);", "    return 1;", "}"],
+                "truncated": False,
+            },
+        ]
+    }
+    # Output order follows the request, not address order.
+    flipped = decompile(FakeParsingToolCall(view), ["0x2000", "0x1100"])
+    assert [entry["name"] for entry in flipped["functions"]] == ["handler", "main"]
+
+
+def test_decompile_many_truncates_lines_and_echoes() -> None:
+    view = _decompile_view()
+    _, decompile = get_tool("rex_decompile_many")
+    clipped = decompile(FakeParsingToolCall(view), ["0x2000"], max_lines=2)
+    assert clipped == {
+        "functions": [
+            {
+                "start": "0x2000",
+                "name": "handler",
+                "lines": ["void handler() {", "    recv(fd, buf, n);"],
+                "truncated": True,
+            }
+        ]
+    }
+    # Exactly at max_lines nothing is reported as truncated.
+    exact = decompile(FakeParsingToolCall(view), ["0x2000"], max_lines=4)
+    assert exact["functions"][0]["truncated"] is False
+    # Rendered lines go through the same per-line echo cap as the other tools.
+    long_view = FakeBinaryView(
+        functions=[FakeFunction("f", 0x1000, 0x1010, hlil=RenderableText("a" * 600))]
+    )
+    echoed = decompile(FakeParsingToolCall(long_view), ["0x1000"])
+    assert echoed["functions"][0]["lines"] == ["a" * tools._MAX_CHARS + "... [88 chars truncated]"]
+
+
+def test_decompile_many_renders_unlifted_functions_as_empty() -> None:
+    # A function can contain addresses without having lifted HLIL; that is an empty
+    # render, not an error and not a truncation.
+    view = _decompile_view()
+    _, decompile = get_tool("rex_decompile_many")
+    assert decompile(FakeParsingToolCall(view), ["0x3000"]) == {
+        "functions": [{"start": "0x3000", "name": "sink", "lines": [], "truncated": False}]
+    }
+
+
+def test_decompile_many_rejects_the_whole_call_on_any_bad_entry() -> None:
+    view = _decompile_view()
+    _, decompile = get_tool("rex_decompile_many")
+    # An unanalyzed address anywhere in the batch rejects the call: no partial results,
+    # no snapping to a neighboring function.
+    for batch in (["0x1100", "0x1800"], ["0x1800", "0x1100"]):
+        with pytest.raises(FakeToolError) as exc:
+            decompile(FakeParsingToolCall(view), batch)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == "no analyzed function contains 0x1800"
+    # An unparsable expression rejects the call the same way.
+    with pytest.raises(FakeToolError) as exc:
+        decompile(FakeParsingToolCall(view), ["0x1100", "garbage"])
+    assert exc.value.code == "invalid_params"
+    assert "bad address expression" in exc.value.message
+
+
+def test_decompile_many_rejects_bad_batch_and_max_lines() -> None:
+    view = _decompile_view()
+    _, decompile = get_tool("rex_decompile_many")
+    for batch in ([], ["0x1100"] * (tools._MAX_DECOMPILE_BATCH + 1)):
+        with pytest.raises(FakeToolError) as exc:
+            decompile(FakeParsingToolCall(view), batch)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == (
+            f"functions must contain between 1 and {tools._MAX_DECOMPILE_BATCH} address expressions"
+        )
+    # Exactly the batch cap is accepted.
+    at_cap = decompile(FakeParsingToolCall(view), ["0x1100"] * tools._MAX_DECOMPILE_BATCH)
+    assert len(at_cap["functions"]) == tools._MAX_DECOMPILE_BATCH
+    # The argument must be a list of strings, not a bare value or non-string entries.
+    with pytest.raises(FakeToolError) as exc:
+        decompile(FakeParsingToolCall(view), "0x1100")
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "functions must be a list of address expressions"
+    with pytest.raises(FakeToolError) as exc:
+        decompile(FakeParsingToolCall(view), [0x1100])
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "functions[0] must be a string address expression"
+    # Range errors win over address resolution, and both bounds are inclusive.
+    for kwargs, message in (
+        ({"max_lines": 0}, "Invalid integer parameter 'max_lines': Must be at least 1"),
+        (
+            {"max_lines": tools._MAX_DECOMPILE_LINES + 1},
+            f"Invalid integer parameter 'max_lines': Must be at most {tools._MAX_DECOMPILE_LINES}",
+        ),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            decompile(FakeParsingToolCall(view), ["garbage"], **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+
+
+def _find_functions_view() -> FakeBinaryView:
+    return FakeBinaryView(
+        segments=[
+            FakeSegment(0x1000, 0x10),
+            FakeSegment(0x2000, 0x10),
+            FakeSegment(0x9000, 0x10),
+        ],
+        memory={
+            0x1000: b"\xeb\x0e\x90\x90" * 4,
+            0x2000: b"\xeb\x0e" + b"\x90" * 14,
+            # This match belongs to no analyzed function and must be skipped.
+            0x9000: b"\xeb\x0e" + b"\x90" * 14,
+        },
+        functions=[FakeFunction("main", 0x1000, 0x1100), FakeFunction("handler", 0x2000, 0x2100)],
+    )
+
+
+def test_find_functions_by_pattern_reports_containing_functions() -> None:
+    view = _find_functions_view()
+    _, find = get_tool("rex_find_functions_by_pattern")
+    result = find(_call(view), "eb 0e")
+    # Functions come back in first-match order; the 0x9000 match is inside no function
+    # and shows up in no entry.
+    assert result == {
+        "truncated": False,
+        "functions": [
+            {
+                "start": "0x1000",
+                "name": "main",
+                "match_count": 4,
+                "addresses": ["0x1000", "0x1004", "0x1008", "0x100c"],
+            },
+            {"start": "0x2000", "name": "handler", "match_count": 1, "addresses": ["0x2000"]},
+        ],
+    }
+
+
+def test_find_functions_by_pattern_caps_examples_at_five() -> None:
+    view = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 0x10)],
+        memory={0x1000: b"\xeb\x0e" * 8},
+        functions=[FakeFunction("f", 0x1000, 0x1100)],
+    )
+    _, find = get_tool("rex_find_functions_by_pattern")
+    result = find(_call(view), "eb0e")
+    # The count stays true while the example list is capped at the first 5 addresses.
+    assert result == {
+        "truncated": False,
+        "functions": [
+            {
+                "start": "0x1000",
+                "name": "f",
+                "match_count": 8,
+                "addresses": [hex(0x1000 + 2 * index) for index in range(5)],
+            }
+        ],
+    }
+
+
+def test_find_functions_by_pattern_limits_offsets_and_truncates() -> None:
+    view = _find_functions_view()
+    _, find = get_tool("rex_find_functions_by_pattern")
+    limited = find(_call(view), "eb0e", limit=1)
+    assert limited["truncated"] is True
+    assert [entry["name"] for entry in limited["functions"]] == ["main"]
+    paged = find(_call(view), "eb0e", limit=1, offset=1)
+    assert paged["truncated"] is False
+    assert [entry["name"] for entry in paged["functions"]] == ["handler"]
+    assert paged["functions"][0]["match_count"] == 1
+    # limit=0 pages nothing out; the scan stops at the first matching function past the
+    # empty window, so truncated says a further one existed.
+    assert find(_call(view), "eb0e", limit=0) == {"truncated": True, "functions": []}
+    assert find(_call(view), "eb0e", offset=5) == {"truncated": False, "functions": []}
+    for kwargs, message in (
+        ({"limit": -1}, "Invalid integer parameter 'limit': Must be at least 0"),
+        (
+            {"limit": tools._MAX_LIMIT + 1},
+            f"Invalid integer parameter 'limit': Must be at most {tools._MAX_LIMIT}",
+        ),
+        ({"offset": -1}, "Invalid integer parameter 'offset': Must be at least 0"),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            find(_call(view), "eb0e", **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+
+
+def test_find_functions_by_pattern_maps_matches_across_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tools, "_READ_CHUNK", 4)
+    _, find = get_tool("rex_find_functions_by_pattern")
+    # A match straddling the chunk edge is only visible because each read extends
+    # pattern_length - 1 bytes past the chunk; it must land in the containing function.
+    straddle = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 8)],
+        memory={0x1000: b"\x00\x00\x00\x33\xeb\x00\x00\x00"},
+        functions=[FakeFunction("f", 0x1000, 0x1100)],
+    )
+    assert find(_call(straddle), "33 eb") == {
+        "truncated": False,
+        "functions": [{"start": "0x1000", "name": "f", "match_count": 1, "addresses": ["0x1003"]}],
+    }
+    # A match starting exactly at the chunk edge is reported once: the reads overlap,
+    # but every match start belongs to exactly one read.
+    boundary = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 8)],
+        memory={0x1000: b"\x00\x00\x00\x00\x33\xeb\x00\x00"},
+        functions=[FakeFunction("f", 0x1000, 0x1100)],
+    )
+    assert find(_call(boundary), "33 eb") == {
+        "truncated": False,
+        "functions": [{"start": "0x1000", "name": "f", "match_count": 1, "addresses": ["0x1004"]}],
+    }
+
+
+def test_find_functions_by_pattern_rejects_invalid_patterns() -> None:
+    view = _find_functions_view()
+    _, find = get_tool("rex_find_functions_by_pattern")
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), "zz")
+    assert exc.value.code == "invalid_pattern"
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), "")
+    assert exc.value.code == "invalid_pattern"
+    oversized = "90" * (tools._MAX_PATTERN_CHARS // 2 + 1)
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), oversized)
+    assert exc.value.code == "pattern_too_large"
+
+
+def test_find_functions_by_pattern_reports_empty_results_on_empty_views() -> None:
+    _, find = get_tool("rex_find_functions_by_pattern")
+    # No segments at all: an empty result is valid, not an error.
+    assert find(_call(FakeBinaryView()), "eb0e") == {"truncated": False, "functions": []}
+    # Pattern bytes exist but no analyzed function covers them: matches are skipped.
+    uncovered = FakeBinaryView(
+        segments=[FakeSegment(0x1000, 4)], memory={0x1000: b"\xeb\x0e\x90\x90"}
+    )
+    assert find(_call(uncovered), "eb0e") == {"truncated": False, "functions": []}
+    # An unreadable segment contributes nothing.
+    unreadable = FakeBinaryView(
+        segments=[FakeSegment(0x9000, 4)],
+        memory={0x1000: b"\xeb\x0e"},
+        functions=[FakeFunction("f", 0x1000, 0x1100)],
+    )
+    assert find(_call(unreadable), "eb0e") == {"truncated": False, "functions": []}
+
+
+# --- rex_export_disasm / rex_export_symbols -------------------------------------------------
+
+
+def _use_export_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the export tools at a per-test root so nothing lands in the real home."""
+    root = tmp_path / "exports"
+    monkeypatch.setattr(tools, "_EXPORT_ROOT", root)
+    return root
+
+
+def test_export_disasm_writes_the_window_to_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    result = export(_call(view), 0x1104, filename="main.txt")
+    expected = "push rbp\nmov rbp, rsp\nsub rsp, 0x20\nmov eax, 1\nleave\nret\n"
+    assert result == {
+        "path": str((root / "main.txt").resolve()),
+        "bytes_written": len(expected.encode("utf-8")),
+        "lines": 6,
+        "truncated": False,
+    }
+    # Byte-exact read: read_bytes also proves the LF endings (no \r\n translation).
+    assert (root / "main.txt").read_bytes() == expected.encode("utf-8")
+
+
+def test_export_disasm_caps_the_window_at_max_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    # Window of 3 lines (anchor 0x1101, before=2, after=1) clipped to 2 by max_lines.
+    clipped = export(_call(view), 0x1101, before=2, after=1, max_lines=2, filename="clip.txt")
+    assert clipped["lines"] == 2
+    assert clipped["truncated"] is True
+    assert (root / "clip.txt").read_bytes() == b"push rbp\nmov rbp, rsp\n"
+    # Exactly at max_lines nothing is reported as truncated.
+    exact = export(_call(view), 0x1104, max_lines=6, filename="full.txt")
+    assert exact["lines"] == 6
+    assert exact["truncated"] is False
+    # A window clipped at a function edge also leaves rendered lines out of the file,
+    # so the truncation flag fires even though no cap was hit.
+    edge = export(_call(view), 0x110E, before=1, after=8, filename="edge.txt")
+    assert edge["lines"] == 2
+    assert edge["truncated"] is True
+
+
+def test_export_disasm_shrinks_to_the_byte_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    # 36 bytes hold exactly the first three lines; the fourth ("mov eax, 1\n") would
+    # push the file to 47 bytes, so it and everything after it are dropped.
+    monkeypatch.setattr(tools, "_MAX_EXPORT_FILE_BYTES", 36)
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    result = export(_call(view), 0x1104, filename="shrink.txt")
+    expected = b"push rbp\nmov rbp, rsp\nsub rsp, 0x20\n"
+    assert result["lines"] == 3
+    assert result["truncated"] is True
+    assert result["bytes_written"] == len(expected)
+    assert (root / "shrink.txt").read_bytes() == expected
+
+
+def test_export_disasm_rejects_a_single_line_over_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    # Even the first line ("push rbp\n" is 9 bytes) cannot fit under an 8-byte cap, so
+    # shrinking from the end could never produce a file: reject instead of writing one.
+    monkeypatch.setattr(tools, "_MAX_EXPORT_FILE_BYTES", 8)
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(view), 0x1104, filename="tiny.txt")
+    assert exc.value.code == "export_failed"
+    assert "first entry" in exc.value.message
+    # The rejection happens before any filesystem work: not even the root was created.
+    assert not root.exists()
+
+
+def test_export_disasm_rejects_out_of_function_addresses_and_ranges() -> None:
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    # Same rejection as rex_disasm_at: never snapped to a neighboring function.
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(view), 0x1800, filename="gap.txt")
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "no analyzed function contains 0x1800"
+    for kwargs, message in (
+        ({"before": -1}, "Invalid integer parameter 'before': Must be at least 0"),
+        ({"after": -1}, "Invalid integer parameter 'after': Must be at least 0"),
+        (
+            {"before": tools._MAX_DISASM_CONTEXT + 1},
+            f"Invalid integer parameter 'before': Must be at most {tools._MAX_DISASM_CONTEXT}",
+        ),
+        (
+            {"after": tools._MAX_DISASM_CONTEXT + 1},
+            f"Invalid integer parameter 'after': Must be at most {tools._MAX_DISASM_CONTEXT}",
+        ),
+        ({"max_lines": 0}, "Invalid integer parameter 'max_lines': Must be at least 1"),
+        (
+            {"max_lines": tools._MAX_EXPORT_DISASM_LINES + 1},
+            f"Invalid integer parameter 'max_lines': Must be at most "
+            f"{tools._MAX_EXPORT_DISASM_LINES}",
+        ),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            export(_call(view), 0x1104, filename="x.txt", **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+    # Both bounds are inclusive on every size parameter.
+    at_caps = export(
+        _call(view),
+        0x1104,
+        before=tools._MAX_DISASM_CONTEXT,
+        after=tools._MAX_DISASM_CONTEXT,
+        max_lines=tools._MAX_EXPORT_DISASM_LINES,
+        filename="caps.txt",
+    )
+    assert at_caps["lines"] == 6
+    # Range errors are checked before the address lookup, like rex_disasm_at.
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(FakeBinaryView()), 0x1104, before=-1, filename="x.txt")
+    assert exc.value.message == "Invalid integer parameter 'before': Must be at least 0"
+
+
+def test_export_disasm_reports_export_failed_when_the_write_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "exports"
+    root.mkdir()
+    # A directory sitting where the file would go makes open() raise IsADirectoryError;
+    # the handler must turn that into export_failed, not leak the OSError.
+    (root / "occupied.txt").mkdir()
+    monkeypatch.setattr(tools, "_EXPORT_ROOT", root)
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(view), 0x1104, filename="occupied.txt")
+    assert exc.value.code == "export_failed"
+
+
+def test_export_symbols_reports_export_failed_when_the_root_cannot_be_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A regular file where the export root would go makes mkdir() raise
+    # NotADirectoryError; the handler must turn that into export_failed, not leak it.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(tools, "_EXPORT_ROOT", blocker / "exports")
+    _, export = get_tool("rex_export_symbols")
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(_symbol_view()), 0x1000, 0x4000, filename="syms.csv")
+    assert exc.value.code == "export_failed"
+    assert "could not prepare export path" in exc.value.message
+
+
+def test_export_disasm_fails_nested_filenames_at_the_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    # Lexical validation allows a nested relative name, but only the fixed root itself is
+    # ever created on demand, so the write fails into export_failed instead of silently
+    # growing a tree under the root.
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(view), 0x1104, filename="sub/out.txt")
+    assert exc.value.code == "export_failed"
+    assert not (root / "sub").exists()
+
+
+def test_export_disasm_accepts_a_component_at_the_name_max_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    filename = "y" * 251 + ".txt"  # exactly 255 bytes, the NAME_MAX bound
+    view = _disasm_view()
+    _, export = get_tool("rex_export_disasm")
+    result = export(_call(view), 0x1104, filename=filename)
+    assert result["path"] == str((root / filename).resolve())
+    assert (root / filename).exists()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "/abs/path.txt",
+        "up/../down.txt",
+        "back\\slash.txt",
+        "nul\x00byte.txt",
+        "x" * 256,
+        "",
+    ],
+)
+def test_export_tools_reject_unsafe_filenames(
+    filename: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _use_export_root(monkeypatch, tmp_path)
+    _, export_disasm = get_tool("rex_export_disasm")
+    with pytest.raises(FakeToolError) as exc:
+        export_disasm(_call(_disasm_view()), 0x1104, filename=filename)
+    assert exc.value.code == "invalid_params"
+    _, export_symbols = get_tool("rex_export_symbols")
+    with pytest.raises(FakeToolError) as exc:
+        export_symbols(_call(_symbol_view()), 0x1000, 0x4000, filename=filename)
+    assert exc.value.code == "invalid_params"
+
+
+def test_validate_export_path_rejects_each_violation_with_a_clear_message() -> None:
+    cases = [
+        ("", "filename must not be empty"),
+        ("/etc/passwd", "filename must be a plain file name, not an absolute path"),
+        ("back\\slash.txt", "filename must not contain backslashes"),
+        ("nul\x00byte.txt", "filename must not contain NUL bytes"),
+        ("up/../down.txt", "filename must not contain '..' path components"),
+        ("x" * 256, f"filename component exceeds {tools._MAX_EXPORT_COMPONENT_BYTES} bytes"),
+    ]
+    for filename, message in cases:
+        with pytest.raises(FakeToolError) as exc:
+            tools._validate_export_path(filename)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+    # Plain names and a component exactly at the NAME_MAX bound pass the pure validator.
+    tools._validate_export_path("plain.txt")
+    tools._validate_export_path("y" * 251 + ".txt")
+    tools._validate_export_path("sub/plain.txt")
+
+
+def _symbol_view() -> FakeBinaryView:
+    # Deliberately unsorted, with symbols below and above the queried range and a name
+    # containing a comma to pin the CSV quoting.
+    return FakeBinaryView(
+        symbols=[
+            FakeSymbol(0x3000, "FunctionSymbol", "late"),
+            FakeSymbol(0x5000, "DataSymbol", "outside"),
+            FakeSymbol(0x1000, "FunctionSymbol", "main"),
+            FakeSymbol(0x0500, "DataSymbol", "early"),
+            FakeSymbol(0x2000, "DataSymbol", "msg, with comma"),
+        ]
+    )
+
+
+def test_export_symbols_writes_a_sorted_csv_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    _, export = get_tool("rex_export_symbols")
+    result = export(_call(_symbol_view()), 0x1000, 0x4000, filename="syms.csv")
+    expected = (
+        "symbol_address,symbol_type,name\n"
+        "0x1000,FunctionSymbol,main\n"
+        '0x2000,DataSymbol,"msg, with comma"\n'
+        "0x3000,FunctionSymbol,late\n"
+    )
+    assert result == {
+        "path": str((root / "syms.csv").resolve()),
+        "bytes_written": len(expected.encode("utf-8")),
+        "rows": 3,
+        "truncated": False,
+        "total": 3,
+    }
+    assert (root / "syms.csv").read_bytes() == expected.encode("utf-8")
+
+
+def test_export_symbols_offset_limit_and_truncation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    _, export = get_tool("rex_export_symbols")
+    view = _symbol_view()
+    header = b"symbol_address,symbol_type,name\n"
+    # The window is a slice of the address-sorted list, and pagination past the end
+    # reports the true total with an empty window.
+    limited = export(_call(view), 0x1000, 0x4000, limit=2, filename="page1.csv")
+    assert limited["rows"] == 2
+    assert limited["total"] == 3
+    assert limited["truncated"] is True
+    paged = export(_call(view), 0x1000, 0x4000, limit=2, offset=1, filename="page2.csv")
+    assert paged["rows"] == 2
+    assert paged["truncated"] is False
+    assert (root / "page2.csv").read_bytes() == (
+        header + b'0x2000,DataSymbol,"msg, with comma"\n' + b"0x3000,FunctionSymbol,late\n"
+    )
+    at_end = export(_call(view), 0x1000, 0x4000, offset=3, filename="tail.csv")
+    assert at_end["rows"] == 0
+    assert at_end["total"] == 3
+    assert at_end["truncated"] is False
+    assert (root / "tail.csv").read_bytes() == header
+    # limit=0 pages nothing out but still reports that more symbols existed.
+    zero = export(_call(view), 0x1000, 0x4000, limit=0, filename="empty.csv")
+    assert zero["rows"] == 0
+    assert zero["total"] == 3
+    assert zero["truncated"] is True
+
+
+def test_export_symbols_writes_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    _, export = get_tool("rex_export_symbols")
+    result = export(_call(_symbol_view()), 0x1000, 0x4000, format="json", filename="syms.json")
+    expected = """[
+  {
+    "symbol_address": "0x1000",
+    "symbol_type": "FunctionSymbol",
+    "name": "main"
+  },
+  {
+    "symbol_address": "0x2000",
+    "symbol_type": "DataSymbol",
+    "name": "msg, with comma"
+  },
+  {
+    "symbol_address": "0x3000",
+    "symbol_type": "FunctionSymbol",
+    "name": "late"
+  }
+]"""
+    assert result["bytes_written"] == len(expected.encode("utf-8"))
+    assert result["rows"] == 3
+    assert result["total"] == 3
+    assert result["truncated"] is False
+    # Byte-exact: indented JSON, closing bracket included, no trailing newline.
+    assert (root / "syms.json").read_bytes() == expected.encode("utf-8")
+
+
+def test_export_symbols_shrinks_to_the_byte_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    two_rows = (
+        "symbol_address,symbol_type,name\n"
+        "0x1000,FunctionSymbol,main\n"
+        '0x2000,DataSymbol,"msg, with comma"\n'
+    )
+    monkeypatch.setattr(tools, "_MAX_EXPORT_FILE_BYTES", len(two_rows.encode("utf-8")))
+    _, export = get_tool("rex_export_symbols")
+    result = export(_call(_symbol_view()), 0x1000, 0x4000, filename="capped.csv")
+    # No pagination happened (the window held all three symbols), so the truncated flag
+    # must come from the size drop alone.
+    assert result["rows"] == 2
+    assert result["total"] == 3
+    assert result["truncated"] is True
+    assert (root / "capped.csv").read_bytes() == two_rows.encode("utf-8")
+
+
+def test_export_symbols_rejects_a_single_row_over_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    # The 32-byte header plus the first row can never fit under a 16-byte cap.
+    monkeypatch.setattr(tools, "_MAX_EXPORT_FILE_BYTES", 16)
+    _, export = get_tool("rex_export_symbols")
+    with pytest.raises(FakeToolError) as exc:
+        export(_call(_symbol_view()), 0x1000, 0x4000, filename="tiny.csv")
+    assert exc.value.code == "export_failed"
+    assert "first entry" in exc.value.message
+    assert not root.exists()
+
+
+def test_export_symbols_writes_a_header_only_file_for_an_empty_range(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _use_export_root(monkeypatch, tmp_path)
+    _, export = get_tool("rex_export_symbols")
+    result = export(_call(_symbol_view()), 0x8000, 0x9000, filename="none.csv")
+    assert result == {
+        "path": str((root / "none.csv").resolve()),
+        "bytes_written": 32,
+        "rows": 0,
+        "truncated": False,
+        "total": 0,
+    }
+    assert (root / "none.csv").read_bytes() == b"symbol_address,symbol_type,name\n"
+
+
+def test_export_symbols_rejects_invalid_ranges_limits_and_format() -> None:
+    view = _symbol_view()
+    _, export = get_tool("rex_export_symbols")
+    for kwargs, message in (
+        ({"start": 0x1000, "end": 0x1000}, "end must be greater than start"),
+        ({"start": 0x4000, "end": 0x1000}, "end must be greater than start"),
+        ({"start": -1, "end": 0x4000}, "Invalid integer parameter 'start': Must be at least 0"),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            export(_call(view), filename="x.csv", **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+    for kwargs, message in (
+        ({"limit": -1}, "Invalid integer parameter 'limit': Must be at least 0"),
+        (
+            {"limit": tools._MAX_EXPORT_SYMBOLS + 1},
+            f"Invalid integer parameter 'limit': Must be at most {tools._MAX_EXPORT_SYMBOLS}",
+        ),
+        ({"offset": -1}, "Invalid integer parameter 'offset': Must be at least 0"),
+        ({"format": "xml"}, "format must be 'csv' or 'json', not 'xml'"),
+    ):
+        with pytest.raises(FakeToolError) as exc:
+            export(_call(view), 0x1000, 0x4000, filename="x.csv", **kwargs)
+        assert exc.value.code == "invalid_params"
+        assert exc.value.message == message
+    # Exactly at the limit cap the export still runs.
+    at_cap = export(
+        _call(view), 0x1000, 0x4000, limit=tools._MAX_EXPORT_SYMBOLS, filename="cap.csv"
+    )
+    assert at_cap["rows"] == 3
