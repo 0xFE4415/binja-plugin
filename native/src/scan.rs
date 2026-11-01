@@ -29,6 +29,8 @@ pub struct RunningScan {
     pub truncated: bool,
     /// Absolute addresses inside the `[offset, offset+limit)` window, ascending.
     pub matches: Vec<u64>,
+    /// Address of the last match `record_new` counted; `None` before the first.
+    last_recorded: Option<u64>,
 }
 
 impl RunningScan {
@@ -54,6 +56,26 @@ impl RunningScan {
             // Still before the window start: keep scanning.
             true
         }
+    }
+
+    /// `record`, but only for an address this bucket has not counted yet.
+    ///
+    /// The multi-pattern walk overlaps consecutive windows by
+    /// longest_pattern - 1 bytes to keep that longest pattern's seam matches
+    /// visible, so a shorter pattern's match starting within
+    /// `overlap - len + 1` bytes of a seam is fully visible in the next window
+    /// too. Windows arrive in ascending address order and each window's own
+    /// matches ascend, so an address at or below the last counted one is
+    /// exactly such a repeat; counting it would inflate `total`, shift
+    /// pagination, and latch `truncated` early. The single-pattern walk never
+    /// revisits an address (its overlap is len - 1) and keeps using `record`,
+    /// so a structural regression there cannot be masked by this dedup.
+    pub fn record_new(&mut self, pagination: &Pagination, addr: u64) -> bool {
+        if self.last_recorded.is_some_and(|last| addr <= last) {
+            return !self.truncated;
+        }
+        self.last_recorded = Some(addr);
+        self.record(pagination, addr)
     }
 
     pub fn is_done(&self) -> bool {

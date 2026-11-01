@@ -172,12 +172,41 @@ where
     true
 }
 
+/// The view surface the chunked segment walk needs: mapped ranges plus bounded
+/// reads. A local seam so tests can drive `for_each_segment` itself — the
+/// `BinaryView` FFI cannot run outside the core, and a test-local copy of the
+/// composition would drift from the wiring it claims to cover.
+trait ChunkedReadView {
+    /// Ascending, non-overlapping readable address ranges.
+    fn segment_ranges(&self) -> Vec<(u64, u64)>;
+    /// Fill `buffer` from `position`, returning the bytes actually read —
+    /// fewer than requested (or none) at an unreadable hole.
+    fn read_into(&self, buffer: &mut [u8], position: u64) -> usize;
+}
+
+impl ChunkedReadView for BinaryView {
+    fn segment_ranges(&self) -> Vec<(u64, u64)> {
+        self.segments()
+            .iter()
+            .map(|segment| {
+                let range = segment.address_range();
+                (range.start, range.end)
+            })
+            .collect()
+    }
+
+    fn read_into(&self, buffer: &mut [u8], position: u64) -> usize {
+        BinaryViewBase::read(self, buffer, position)
+    }
+}
+
 /// Read every mapped segment (clipped to `bounds`) through the chunked window
 /// walk and run `step` over each window's bytes in address order. `step`
 /// receives the window's base address and the bytes actually read, which may be
 /// shorter than requested (or empty) when the core hits an unreadable hole.
-fn for_each_segment<F>(
-    view: &BinaryView,
+fn for_each_segment<V: ChunkedReadView, F>(
+    view: &V,
+    chunk: u64,
     bounds: Option<(u64, u64)>,
     overlap: u64,
     mut step: F,
@@ -187,15 +216,14 @@ where
 {
     // One reusable buffer for the largest possible window, allocated once per
     // scan — never the whole segment (a multi-GB segment must not allocate).
-    let mut buffer = vec![0u8; usize::try_from(READ_CHUNK + overlap).unwrap_or(usize::MAX)];
-    for segment in &view.segments() {
-        let range = segment.address_range();
-        let Some((start, end)) = clamp_to_bounds((range.start, range.end), bounds) else {
+    let mut buffer = vec![0u8; usize::try_from(chunk + overlap).unwrap_or(usize::MAX)];
+    for (start, end) in view.segment_ranges() {
+        let Some((start, end)) = clamp_to_bounds((start, end), bounds) else {
             continue;
         };
-        let alive = for_each_window(start, end, READ_CHUNK, overlap, |position, read_size| {
+        let alive = for_each_window(start, end, chunk, overlap, |position, read_size| {
             let read_size = read_size as usize;
-            let size = view.read(&mut buffer[..read_size], position);
+            let size = view.read_into(&mut buffer[..read_size], position);
             step(position, &buffer[..size])
         });
         if !alive {
@@ -244,7 +272,7 @@ impl TypedMcpTool for RxDataFind {
         let bounds = resolve_bounds(&view, &args.section)?;
         let overlap = pattern.len().saturating_sub(1) as u64;
         let mut running = RunningScan::new();
-        for_each_segment(&view, bounds, overlap, |base, data| {
+        for_each_segment(&*view, READ_CHUNK, bounds, overlap, |base, data| {
             scan_pattern(data, base, &pattern, &pagination, &mut running)
         });
         Ok(McpToolResult::structured(json!({
@@ -311,7 +339,7 @@ impl TypedMcpTool for RxMultiFind {
             .max()
             .unwrap_or(1);
         let overlap = longest.saturating_sub(1) as u64;
-        for_each_segment(&view, bounds, overlap, |base, data| {
+        for_each_segment(&*view, READ_CHUNK, bounds, overlap, |base, data| {
             matcher.scan_segment(data, base, &patterns, &mut buckets, &pagination)
         });
         let results = args
@@ -388,56 +416,52 @@ mod tests {
         assert_eq!(error.message, "pattern 2: invalid hex byte token 'zz'");
     }
 
-    // --- segment iteration: pure helpers standing in for the FFI view -------
+    // --- segment iteration: FakeView standing in for the FFI view -----------
 
-    /// A tiny stand-in for BinaryView reads: ascending, non-overlapping
-    /// readable runs. A read returns the contiguous bytes available from
-    /// `position` inside the run it starts in — the short or empty read an
-    /// unreadable hole produces.
+    /// A tiny stand-in for BinaryView: ascending, non-overlapping readable
+    /// runs. A read returns the contiguous bytes available from `position`
+    /// inside the run it starts in — the short or empty read an unreadable
+    /// hole produces.
     struct FakeView {
+        segments: Vec<(u64, u64)>,
         runs: Vec<(u64, Vec<u8>)>,
     }
 
-    impl FakeView {
-        fn read(&self, position: u64, size: u64) -> Vec<u8> {
+    impl ChunkedReadView for FakeView {
+        fn segment_ranges(&self) -> Vec<(u64, u64)> {
+            self.segments.clone()
+        }
+
+        fn read_into(&self, buffer: &mut [u8], position: u64) -> usize {
             for (start, bytes) in &self.runs {
                 let run_end = *start + bytes.len() as u64;
                 if position >= *start && position < run_end {
                     let offset = (position - start) as usize;
-                    let taken = bytes.len().min(offset + size as usize);
-                    return bytes[offset..taken].to_vec();
+                    let taken = bytes.len().min(offset + buffer.len());
+                    let copied = taken - offset;
+                    buffer[..copied].copy_from_slice(&bytes[offset..taken]);
+                    return copied;
                 }
             }
-            Vec::new()
+            0
         }
     }
 
-    /// The production composition — clamp_to_bounds + for_each_window +
-    /// scan_pattern — with FakeView standing in for the BinaryView FFI, which
-    /// cannot run in tests. Same structure as for_each_segment minus the core
-    /// calls.
+    /// Drive the production `for_each_segment` — clamp_to_bounds +
+    /// for_each_window + the reusable read buffer — with FakeView standing in
+    /// for the BinaryView FFI, which cannot run in tests.
     fn scan_fake_view(
         view: &FakeView,
-        segments: &[(u64, u64)],
-        bounds: Option<(u64, u64)>,
         chunk: u64,
+        bounds: Option<(u64, u64)>,
         overlap: u64,
         pattern: &HexPattern,
         pagination: &Pagination,
     ) -> RunningScan {
         let mut running = RunningScan::new();
-        for &(segment_start, segment_end) in segments {
-            let Some((start, end)) = clamp_to_bounds((segment_start, segment_end), bounds) else {
-                continue;
-            };
-            let alive = for_each_window(start, end, chunk, overlap, |position, read_size| {
-                let data = view.read(position, read_size);
-                scan_pattern(&data, position, pattern, pagination, &mut running)
-            });
-            if !alive {
-                break;
-            }
-        }
+        for_each_segment(view, chunk, bounds, overlap, |base, data| {
+            scan_pattern(data, base, pattern, pagination, &mut running)
+        });
         running
     }
 
@@ -531,6 +555,7 @@ mod tests {
     fn finds_matches_across_chunk_boundaries() {
         // Python test_data_find_finds_matches_across_chunk_boundaries analog.
         let view = FakeView {
+            segments: vec![(0x1000, 0x1008)],
             runs: vec![(0x1000, b"\x00\x00\x33\xeb\x00\x00\x33\xeb".to_vec())],
         };
         let pattern = HexPattern::parse("33 eb").unwrap();
@@ -538,7 +563,7 @@ mod tests {
             offset: 0,
             limit: 50,
         };
-        let running = scan_fake_view(&view, &[(0x1000, 0x1008)], None, 4, 1, &pattern, &page);
+        let running = scan_fake_view(&view, 4, None, 1, &pattern, &page);
         assert_eq!(running.total, 2);
         assert_eq!(running.matches, vec![0x1002, 0x1006]);
     }
@@ -556,16 +581,18 @@ mod tests {
             limit: 50,
         };
         let straddle = FakeView {
+            segments: vec![(0x1000, 0x1008)],
             runs: vec![(0x1000, b"\x00\x00\x00\x33\xeb\x00\x00\x00".to_vec())],
         };
-        let running = scan_fake_view(&straddle, &[(0x1000, 0x1008)], None, 4, 1, &pattern, &page);
+        let running = scan_fake_view(&straddle, 4, None, 1, &pattern, &page);
         assert_eq!(running.total, 1);
         assert_eq!(running.matches, vec![0x1003]);
 
         let boundary = FakeView {
+            segments: vec![(0x1000, 0x1008)],
             runs: vec![(0x1000, b"\x00\x00\x00\x00\x33\xeb\x00\x00".to_vec())],
         };
-        let running = scan_fake_view(&boundary, &[(0x1000, 0x1008)], None, 4, 1, &pattern, &page);
+        let running = scan_fake_view(&boundary, 4, None, 1, &pattern, &page);
         assert_eq!(running.total, 1);
         assert_eq!(running.matches, vec![0x1004]);
     }
@@ -578,6 +605,7 @@ mod tests {
     #[test]
     fn recovers_matches_after_short_and_empty_reads() {
         let view = FakeView {
+            segments: vec![(0x2000, 0x2010)],
             runs: vec![
                 (0x2000, b"\x90\x90".to_vec()), // short read: 2 of 5 requested
                 (0x2008, b"\x33\xeb".to_vec()), // match after the hole
@@ -588,7 +616,7 @@ mod tests {
             offset: 0,
             limit: 50,
         };
-        let running = scan_fake_view(&view, &[(0x2000, 0x2010)], None, 4, 1, &pattern, &page);
+        let running = scan_fake_view(&view, 4, None, 1, &pattern, &page);
         assert_eq!(running.total, 1);
         assert_eq!(running.matches, vec![0x2008]);
     }
@@ -605,6 +633,7 @@ mod tests {
         let matcher = MultiMatcher::new(&patterns);
         let mut buckets = vec![RunningScan::new(), RunningScan::new()];
         let view = FakeView {
+            segments: vec![(0x1000, 0x1008)],
             runs: vec![(0x1000, b"\x00\x00\x00\x33\xeb\x00\x00\x00".to_vec())],
         };
         let page = Pagination {
@@ -612,13 +641,54 @@ mod tests {
             limit: 50,
         };
         let overlap = patterns.iter().map(|p| p.len()).max().unwrap_or(1) as u64 - 1;
-        let alive = for_each_window(0x1000, 0x1008, 4, overlap, |position, read_size| {
-            let data = view.read(position, read_size);
-            matcher.scan_segment(&data, position, &patterns, &mut buckets, &page)
+        let alive = for_each_segment(&view, 4, None, overlap, |base, data| {
+            matcher.scan_segment(data, base, &patterns, &mut buckets, &page)
         });
         assert!(alive);
         assert_eq!(buckets[0].matches, vec![0x1003]);
         assert_eq!(buckets[1].matches, vec![0x1003]);
+    }
+
+    /// The overlap that protects the longest pattern re-exposes the seam zone
+    /// of every window in its successor: a shorter pattern's match starting
+    /// there is fully visible in two consecutive windows and must still be
+    /// counted once per bucket — the per-pattern `rex_data_find` contract the
+    /// multi result promises. Regression: '33 eb' starting exactly at the
+    /// 0x1004 seam was recorded in window 0 and again in window 1.
+    #[test]
+    fn multi_seam_matches_of_shorter_patterns_are_counted_once() {
+        let patterns = vec![
+            HexPattern::parse("33 eb").unwrap(),
+            HexPattern::parse("33 eb 00").unwrap(),
+        ];
+        let matcher = MultiMatcher::new(&patterns);
+        let mut buckets = vec![RunningScan::new(), RunningScan::new()];
+        // Seam at 0x1004 (chunk 4, overlap longest-1 = 2): '33 eb' starts
+        // exactly on it, so windows 0 and 1 both see it whole; 0x1009 is a
+        // control that only window 2 covers. The 3-byte pattern's matches at
+        // the same addresses fit one window each.
+        let view = FakeView {
+            segments: vec![(0x1000, 0x1010)],
+            runs: vec![(
+                0x1000,
+                b"\x00\x00\x00\x00\x33\xeb\x00\x00\x00\x33\xeb\x00\x00\x00\x00\x00".to_vec(),
+            )],
+        };
+        let page = Pagination {
+            offset: 0,
+            limit: 50,
+        };
+        let overlap = patterns.iter().map(|p| p.len()).max().unwrap_or(1) as u64 - 1;
+        let alive = for_each_segment(&view, 4, None, overlap, |base, data| {
+            matcher.scan_segment(data, base, &patterns, &mut buckets, &page)
+        });
+        assert!(alive);
+        assert_eq!(buckets[0].matches, vec![0x1004, 0x1009]);
+        assert_eq!(buckets[0].total, 2);
+        assert!(!buckets[0].truncated);
+        assert_eq!(buckets[1].matches, vec![0x1004, 0x1009]);
+        assert_eq!(buckets[1].total, 2);
+        assert!(!buckets[1].truncated);
     }
 
     #[test]
@@ -642,6 +712,7 @@ mod tests {
         // limit is honored through the real chunked scan (production
         // READ_CHUNK), and the scan stops one match past the window.
         let view = FakeView {
+            segments: vec![(0x1000, 0x1000 + 600)],
             runs: vec![(0x1000, vec![0x90; 600])],
         };
         let pattern = HexPattern::parse("90").unwrap();
@@ -649,15 +720,7 @@ mod tests {
             offset: 0,
             limit: 500,
         };
-        let running = scan_fake_view(
-            &view,
-            &[(0x1000, 0x1000 + 600)],
-            None,
-            READ_CHUNK,
-            0,
-            &pattern,
-            &page,
-        );
+        let running = scan_fake_view(&view, READ_CHUNK, None, 0, &pattern, &page);
         assert_eq!(running.matches.len(), 500);
         assert_eq!(running.total, 501);
         assert!(running.truncated);
@@ -681,10 +744,11 @@ mod tests {
         for case in 0..32u32 {
             let blob_len = (next() % 48) as usize;
             let blob: Vec<u8> = (0..blob_len).map(|_| (next() % 4) as u8).collect();
+            let segment = (0x2000, 0x2000 + (blob_len.max(1)) as u64);
             let view = FakeView {
+                segments: vec![segment],
                 runs: vec![(0x2000, blob)],
             };
-            let segment = (0x2000, 0x2000 + (blob_len.max(1)) as u64);
             let pat_len = 1 + (next() % 3) as usize;
             let tokens: Vec<String> = (0..pat_len)
                 .map(|_| {
@@ -702,7 +766,7 @@ mod tests {
                 offset: 0,
                 limit: 500,
             };
-            let full = scan_fake_view(&view, &[segment], None, 4, overlap, &pattern, &full_page);
+            let full = scan_fake_view(&view, 4, None, overlap, &pattern, &full_page);
             assert!(!full.truncated, "case {case}");
             assert_eq!(full.matches.len() as u64, full.total, "case {case}");
             let true_total = full.total;
@@ -711,9 +775,8 @@ mod tests {
             for page_offset in (0..=true_total).step_by(2) {
                 let page = scan_fake_view(
                     &view,
-                    &[segment],
-                    None,
                     4,
+                    None,
                     overlap,
                     &pattern,
                     &Pagination {
@@ -729,9 +792,8 @@ mod tests {
             for page_offset in 0..=true_total {
                 let page = scan_fake_view(
                     &view,
-                    &[segment],
-                    None,
                     4,
+                    None,
                     overlap,
                     &pattern,
                     &Pagination {
@@ -764,9 +826,8 @@ mod tests {
             let offset = ((next() as u64) << 32) | next() as u64;
             let page = scan_fake_view(
                 &view,
-                &[segment],
-                None,
                 4,
+                None,
                 overlap,
                 &pattern,
                 &Pagination { offset, limit },

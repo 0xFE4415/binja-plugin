@@ -115,7 +115,9 @@ impl MultiMatcher {
                 if !verify_at(haystack, candidate, pattern.bytes()) {
                     continue;
                 }
-                if !bucket.record(pagination, base + candidate as u64) {
+                // Shorter-than-longest patterns re-see their seam matches in
+                // the next window; count each address once.
+                if !bucket.record_new(pagination, base + candidate as u64) {
                     done += 1;
                     if done == buckets.len() {
                         return false;
@@ -136,7 +138,7 @@ impl MultiMatcher {
             }
             for candidate in 0..=haystack.len() - pattern.len() {
                 // An all-wildcard pattern matches unconditionally.
-                if !bucket.record(pagination, base + candidate as u64) {
+                if !bucket.record_new(pagination, base + candidate as u64) {
                     done += 1;
                     break;
                 }

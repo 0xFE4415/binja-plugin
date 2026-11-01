@@ -31,9 +31,10 @@ changes an error code a client branches on:
    arbitrarily large offsets; Rust rejects them at deserialization. u64 spans
    the entire addressable space, so such an offset can never name a real page.
 3. **Hex token parsing is stricter.** Python's `int(token, 16)` accepts `"+4"`
-   and exotic Unicode digits, and crashes with an uncaught `ValueError` (a
-   500, not a tool error) on `"-1"`; Rust rejects all three uniformly with
-   `invalid_pattern` — strictly better, and pinned deliberately by
+   and exotic Unicode digits, and even lets `"-1"` through parsing — the
+   uncaught `ValueError` (a 500, not a tool error) only fires afterwards, in
+   `compile_hex_pattern`'s byte conversion; Rust rejects all three uniformly
+   with `invalid_pattern` — strictly better, and pinned deliberately by
    `rejects_bad_tokens`.
 
 Error precedence is aligned, not divergent: both resolve the binary view

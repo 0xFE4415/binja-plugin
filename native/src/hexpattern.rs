@@ -208,6 +208,23 @@ mod tests {
             HexPattern::parse("?a").unwrap_err().message,
             "invalid hex byte token '?a'"
         );
+        // Divergences from the Python parser (native/README.md "Known
+        // divergences" #3): int(token, 16) there parses a leading '+' and
+        // Unicode decimal digits as ordinary bytes, and even passes '-1'
+        // through to crash later, uncaught, in compile_hex_pattern's byte
+        // conversion — the native parser takes ASCII hex digits only.
+        assert_eq!(
+            HexPattern::parse("+4").unwrap_err().message,
+            "invalid hex byte token '+4'"
+        );
+        assert_eq!(
+            HexPattern::parse("-1").unwrap_err().message,
+            "invalid hex byte token '-1'"
+        );
+        assert_eq!(
+            HexPattern::parse("４４").unwrap_err().message,
+            "invalid hex byte token '４４'"
+        );
     }
 
     #[test]
