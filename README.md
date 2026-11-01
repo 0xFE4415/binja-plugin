@@ -81,6 +81,10 @@ uvx nox -s check   # format, ruff, ty, and pytest with a 100% line-coverage gate
 uvx nox -s test    # tests only
 ```
 
+Markdown is linted only in CI (`markdownlint-cli2`, config in `.markdownlint.yaml`): the
+default rules plus MD013 at 100 characters per line — headings and code blocks included.
+Keep Markdown lines at or under 100 columns; the local `check` session will not catch it.
+
 Tests run against a fake `binaryninja` package installed by `tests/conftest.py`, so no
 Binary Ninja installation or license is needed for the test suite.
 
