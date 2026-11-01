@@ -1,7 +1,13 @@
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 from binaryninja.function import Function
+
+
+class LinearDisassemblyLine:
+    """One rendered line of the linear view; function is None for non-function lines."""
+
+    function: Function | None
 
 
 class Section:
@@ -39,8 +45,17 @@ class BinaryView:
     segments: list[Any]
     functions: list[Function]
     tag_types: Mapping[str, Any]
+    start: int
+    end: int
 
     def get_section_by_name(self, name: str) -> Section | None: ...
+    def find_all_constant(
+        self,
+        start: int,
+        end: int,
+        constant: int,
+        progress_func: Callable[[int, int], bool] | None = None,
+    ) -> Iterator[tuple[int, LinearDisassemblyLine]]: ...
     def read(self, address: int, length: int) -> bytes: ...
     def write(self, address: int, data: bytes) -> int: ...
     def get_functions_containing(self, address: int) -> list[Function]: ...

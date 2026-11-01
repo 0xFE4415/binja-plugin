@@ -27,12 +27,12 @@ clients that already connected must reconnect to see the registered `rex_*` tool
 | --- | --- |
 | `rex_string_search` | Substring/regex search over strings, with section and type filters. |
 | `rex_data_find` | Hex byte pattern search (`??` wildcards) over mapped segments. |
-| `rex_constant_find` | Find functions whose MLIL references an immediate constant. |
-| `rex_hlil_grep` | Regular expression search across rendered HLIL text. |
+| `rex_constant_find` | Finds constant references via the core's linear-view constant search. |
+| `rex_hlil_grep` | Regular expression search across rendered HLIL text, with a resumable cursor. |
 | `rex_call_paths` | Bounded breadth-first call-path search between two functions. |
 | `rex_function_containing` | List the functions containing an address. |
 | `rex_function_define` | Turn the bytes at an address into a function. |
-| `rex_function_undefine` | Remove the user function covering an address (destructive). |
+| `rex_function_undefine` | Remove the function covering an address (destructive). |
 | `rex_string_read_at` | Read the detected string at an address. |
 | `rex_memory_write` | Patch bytes in the binary view (destructive). |
 | `rex_tag_set` | Attach a GUI-visible tag at an address, creating the tag type on demand. |
@@ -47,6 +47,22 @@ normalized: a value outside its documented range — including above the resourc
 rejected with the MCP layer's `invalid_params` argument error. Echoed strings (names, tag
 data, key values, `rex_eval_python` output) are additionally capped in length, with a
 `... [N chars truncated]` suffix and a companion `*_truncated` flag whenever a cap bites.
+
+## Bounds on database-wide scans
+
+On a six-figure-function database the two whole-database searches are bounded per
+invocation:
+
+- `rex_constant_find` runs the core's linear-view constant search (the engine behind
+  Search > For Constant) instead of generating IL for every function. It matches values
+  displayed as constant or pointer tokens in rendered instructions — the same reference a
+  reader sees in the disassembly — and stops as soon as the requested `limit`/`offset`
+  window is known to be complete. Only a value that never occurs in the view pays for a
+  full sweep, which is a bounded, core-side pass.
+- `rex_hlil_grep` renders HLIL for at most `max_functions` functions per invocation. The
+  first render of a function's HLIL costs tens of milliseconds, so large databases are
+  paged: each result carries `next_offset`, and callers pass it back as `offset` until
+  `truncated` is false.
 
 ## Known limits
 

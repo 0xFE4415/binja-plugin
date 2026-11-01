@@ -10,15 +10,13 @@ import contextlib
 import io
 import re
 from collections import deque
-from collections.abc import Iterator
+from itertools import islice
 from typing import Annotated, Literal
 
 import binaryninja
 from binaryninja import mcp
 from binaryninja.binaryview import BinaryView
-from binaryninja.enums import MediumLevelILOperation
 from binaryninja.function import Function
-from binaryninja.mediumlevelil import MediumLevelILInstruction
 
 from binja_plugin.hexpattern import HexPatternError, compile_hex_pattern
 
@@ -31,6 +29,8 @@ _MAX_CHARS = 512
 _MAX_LIMIT = 500
 _MAX_HLIL_GREP_LIMIT = 200
 _MAX_HLIL_GREP_FUNCTIONS = 5000
+# rex_constant_find matches displayed constants, which are at most 64-bit values.
+_MAX_CONSTANT_VALUE = 2**64 - 1
 _MAX_CALL_PATH_DEPTH = 16
 _MAX_CALL_PATHS = 50
 _MAX_FUNCTION_ENTRIES = 50
@@ -109,24 +109,6 @@ def _function_entry(function: Function) -> dict[str, object]:
     return {"start": hex(function.start), "name": _truncate(function.name)}
 
 
-def _iter_mlil_constants(
-    instruction: MediumLevelILInstruction,
-) -> Iterator[MediumLevelILInstruction]:
-    if instruction.operation in (
-        MediumLevelILOperation.MLIL_CONST,
-        MediumLevelILOperation.MLIL_CONST_PTR,
-    ):
-        yield instruction
-        return
-    for operand in instruction.operands:
-        if isinstance(operand, MediumLevelILInstruction):
-            yield from _iter_mlil_constants(operand)
-        elif isinstance(operand, list):
-            for item in operand:
-                if isinstance(item, MediumLevelILInstruction):
-                    yield from _iter_mlil_constants(item)
-
-
 @mcp.tool(read_only=True)
 def rex_call_paths(
     call: mcp.ToolCall,
@@ -194,46 +176,67 @@ def rex_call_paths(
 @mcp.tool(read_only=True)
 def rex_constant_find(
     call: mcp.ToolCall,
-    value: int,
+    value: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_CONSTANT_VALUE)],
     function_filter: str = "",
     limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_LIMIT)] = 50,
+    offset: Annotated[int, mcp.Minimum(0)] = 0,
 ) -> dict[str, object]:
-    """Find functions whose MLIL references an immediate constant value.
+    """Find functions whose rendered instructions reference an immediate constant value.
 
-    Each function reports at most the first 6 matching instruction addresses.
+    Uses the core's linear-view constant search (the engine behind Search > For
+    Constant), so the core renders each function's instruction text once instead of
+    this tool generating IL for every function. A constant counts as referenced when
+    an instruction line of the function displays it as a constant or pointer token;
+    lines outside any function are ignored. The scan stops as soon as the requested
+    result window is known to be complete, and a full view sweep — the worst case,
+    reached only when ``value`` never appears — stays a bounded, core-side pass.
+    Each function reports at most the first 6 matching addresses.
 
-    :param value: Immediate value to search for, e.g. 31337 or 65534.
+    :param value: Immediate value to search for, e.g. 31337 or 65534; compared
+        against displayed (unsigned) constants, so 0 to 2**64 - 1.
     :param function_filter: Case-insensitive regular expression matched against function names.
     :param limit: Maximum number of matching functions to return (0 to 500).
+    :param offset: Number of matching functions to skip before collecting results (>= 0).
     """
     bv = call.binary_view
+    value = _validate_range("value", value, 0, _MAX_CONSTANT_VALUE)
     limit = _validate_range("limit", limit, 0, _MAX_LIMIT)
+    offset = _validate_range("offset", offset, 0)
     name_matcher = _name_filter(function_filter)
     functions: list[dict[str, object]] = []
     truncated = False
-    for function in bv.functions:
-        if len(functions) >= limit:
-            truncated = True
-            break
+    abort = False
+
+    def keep_scanning(current: int, total: int) -> bool:
+        return not abort
+
+    matched = 0
+    current_start: int | None = None
+    current_addresses: list[str] = []
+    for address, line in bv.find_all_constant(bv.start, bv.end, value, progress_func=keep_scanning):
+        function = line.function
+        if function is None:
+            continue
         if name_matcher is not None and name_matcher.search(function.name) is None:
             continue
-        mlil = function.mlil
-        if mlil is None:
-            continue
-        addresses = []
-        for instruction in mlil.instructions:
-            for constant in _iter_mlil_constants(instruction):
-                if int(constant.constant) == value:
-                    addresses.append(hex(instruction.address))
-                    break
-        if addresses:
-            functions.append(
-                {
-                    "start": hex(function.start),
-                    "name": _truncate(function.name),
-                    "addresses": addresses[:6],
-                }
-            )
+        if function.start != current_start:
+            matched += 1
+            if matched > offset + limit:
+                # One match past the requested window proves more functions exist.
+                truncated = True
+                abort = True
+                break
+            current_start = int(function.start)
+            current_addresses = []
+            entry: dict[str, object] = {
+                "start": hex(function.start),
+                "name": _truncate(function.name),
+                "addresses": current_addresses,
+            }
+            if matched > offset:
+                functions.append(entry)
+        if len(current_addresses) < 6:
+            current_addresses.append(hex(address))
     return {"truncated": truncated, "functions": functions}
 
 
@@ -392,6 +395,7 @@ def rex_hlil_grep(
     function_filter: str = "",
     limit: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_LIMIT)] = 20,
     max_functions: Annotated[int, mcp.Minimum(0), mcp.Maximum(_MAX_HLIL_GREP_FUNCTIONS)] = 2000,
+    offset: Annotated[int, mcp.Minimum(0)] = 0,
 ) -> dict[str, object]:
     """Search rendered HLIL text across functions with a regular expression.
 
@@ -399,22 +403,31 @@ def rex_hlil_grep(
     catastrophic backtracking can stall the scan. Each function reports at most the
     first 3 matching HLIL lines.
 
+    Rendering HLIL is the dominant cost: tens of milliseconds per function the first
+    time a function's HLIL is generated. A single invocation never renders more than
+    ``max_functions`` functions; page through a larger database by passing the
+    ``next_offset`` of the previous result as ``offset`` until ``truncated`` is false.
+
     :param regex: Regular expression applied to every rendered HLIL line.
     :param function_filter: Case-insensitive regular expression matched against function names.
     :param limit: Maximum number of matching functions to return (0 to 200).
     :param max_functions: Maximum number of functions to scan before stopping (0 to 5000).
+    :param offset: Number of functions to skip before scanning starts (>= 0).
     """
     bv = call.binary_view
     limit = _validate_range("limit", limit, 0, _MAX_HLIL_GREP_LIMIT)
     max_functions = _validate_range("max_functions", max_functions, 0, _MAX_HLIL_GREP_FUNCTIONS)
+    offset = _validate_range("offset", offset, 0)
     matcher = _compile_user_regex(regex)
     name_matcher = _name_filter(function_filter)
     matches: list[dict[str, object]] = []
     scanned = 0
     truncated = False
-    for function in bv.functions:
+    next_offset: int | None = None
+    for index, function in enumerate(islice(bv.functions, offset, None), offset):
         if len(matches) >= limit or scanned >= max_functions:
             truncated = True
+            next_offset = index
             break
         if name_matcher is not None and name_matcher.search(function.name) is None:
             continue
@@ -431,7 +444,12 @@ def rex_hlil_grep(
                     "lines": [_truncate(line) for line in lines[:3]],
                 }
             )
-    return {"scanned": scanned, "truncated": truncated, "functions": matches}
+    return {
+        "scanned": scanned,
+        "truncated": truncated,
+        "functions": matches,
+        "next_offset": next_offset,
+    }
 
 
 @mcp.tool(destructive=True)

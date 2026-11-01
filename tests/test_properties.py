@@ -237,6 +237,50 @@ def test_data_find_rejects_out_of_range_pagination(blob: bytes, limit: int, offs
         assert exc.value.message == "Invalid integer parameter 'offset': Must be at least 0"
 
 
+# --- rex_constant_find pagination ------------------------------------------------------
+#
+# One function per matched address keeps the reference list trivial: the full
+# untruncated scan is the reference, and every page must be the exact slice of it with
+# "truncated" meaning exactly "matches exist past the window".
+
+
+@given(
+    names=st.lists(st.text(alphabet="abcde", min_size=1, max_size=4), min_size=1, max_size=8),
+    limit=st.integers(min_value=0, max_value=tools._MAX_LIMIT),
+    offset=st.integers(min_value=0, max_value=2**63),
+)
+def test_constant_find_pages_tile_the_full_result(
+    names: list[str], limit: int, offset: int
+) -> None:
+    functions = [
+        FakeFunction(name, 0x1000 + 16 * index, 0x1010 + 16 * index)
+        for index, name in enumerate(names)
+    ]
+    view = FakeBinaryView(
+        functions=functions,
+        constant_references=[(7, function.start + 8, function) for function in functions],
+    )
+    _, find = get_tool("rex_constant_find")
+    call = FakeToolCall(view)
+    full = find(call, value=7, limit=tools._MAX_LIMIT)
+    assert full["truncated"] is False
+    everything = full["functions"]
+    true_total = len(everything)
+
+    # Tiling: consecutive pages of 2 reproduce the full result with no gaps or duplicates.
+    tiled = [
+        found
+        for page_offset in range(0, true_total + 1, 2)
+        for found in find(call, value=7, limit=2, offset=page_offset)["functions"]
+    ]
+    assert tiled == everything
+
+    # An arbitrary adversarial (but valid) offset pages the exact expected slice.
+    page = find(call, value=7, limit=limit, offset=offset)
+    assert page["functions"] == everything[offset : offset + limit]
+    assert page["truncated"] is (true_total > offset + limit)
+
+
 # --- rex_tag_list paging -------------------------------------------------------------
 #
 # tag_list reports the true total (it builds the whole list before slicing), slices

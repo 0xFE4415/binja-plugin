@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import sys
 import types
+from collections.abc import Callable, Iterator
 from typing import Any, override
 
 REGISTERED_TOOLS: list[tuple[str, dict[str, object], Any]] = []
@@ -177,6 +178,13 @@ class FakeMLIL:
         self.instructions = instructions
 
 
+class FakeLinearDisassemblyLine:
+    """Mirrors the LinearDisassemblyLine yielded by BinaryView.find_all_constant."""
+
+    def __init__(self, function: FakeFunction | None) -> None:
+        self.function = function
+
+
 class FakeFunction:
     def __init__(
         self,
@@ -223,6 +231,9 @@ class FakeBinaryView:
         functions: list[FakeFunction] | None = None,
         sections: dict[str, tuple[int, int]] | None = None,
         memory: dict[int, bytes] | None = None,
+        start: int = 0,
+        end: int = 0x10000,
+        constant_references: list[tuple[int, int, FakeFunction | None]] | None = None,
     ) -> None:
         self.strings = strings if strings is not None else []
         self.segments = segments if segments is not None else []
@@ -235,12 +246,46 @@ class FakeBinaryView:
         self.written: list[tuple[int, bytes]] = []
         self.created_functions: list[FakeFunction] = []
         self.removed_functions: list[FakeFunction] = []
+        self.start = start
+        self.end = end
+        # (value, address, function) triples answered by find_all_constant; a None
+        # function models a match on a line that belongs to no function (data text).
+        self.constant_references = constant_references or []
+        self.constant_scan_yields = 0
+        # Set once progress_func declines, modeling the core honoring the abort.
+        self.constant_scan_aborted: bool | None = None
 
     def get_section_by_name(self, name: str) -> object:
         if name not in self._sections:
             return None
         start, end = self._sections[name]
         return types.SimpleNamespace(start=start, end=end)
+
+    def find_all_constant(
+        self,
+        start: int,
+        end: int,
+        value: int,
+        progress_func: Callable[[int, int], bool] | None = None,
+    ) -> Iterator[tuple[int, FakeLinearDisassemblyLine]]:
+        """Yield (address, line) matches in address order, aborting when progress declines."""
+        matches = sorted(
+            (
+                (address, function)
+                for matched_value, address, function in self.constant_references
+                if matched_value == value and start <= address < end
+            ),
+            key=lambda match: match[0],
+        )
+        try:
+            for address, function in matches:
+                self.constant_scan_yields += 1
+                yield address, FakeLinearDisassemblyLine(function)
+        finally:
+            # The core keeps scanning — and polling progress — after the caller stops
+            # consuming matches, so model the shutdown poll even on an early break.
+            if progress_func is not None and progress_func(self.end, self.end) is False:
+                self.constant_scan_aborted = True
 
     def read(self, address: int, length: int) -> bytes | None:
         for base, blob in self._memory.items():

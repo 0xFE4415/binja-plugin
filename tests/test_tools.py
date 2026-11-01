@@ -293,23 +293,49 @@ def test_data_find_skips_unreadable_segments() -> None:
     assert find(_call(view), pattern="ff")["total"] == 0
 
 
-def test_constant_find_finds_immediates() -> None:
-    view = _view_with_functions()
+def _constant_view() -> FakeBinaryView:
+    functions = [
+        FakeFunction("main", 0x1100, 0x1200),
+        FakeFunction("handler", 0x2000, 0x2100),
+        FakeFunction("sink", 0x3000, 0x3100),
+    ]
+    return FakeBinaryView(
+        functions=functions,
+        constant_references=[
+            (0x31337, 0x1140, functions[0]),
+            (0x31337, 0x1150, functions[0]),
+            (0x31337, 0x2050, functions[1]),
+            (0x1234, 0x3010, functions[2]),
+        ],
+    )
+
+
+def test_constant_find_reports_functions_from_the_constant_search() -> None:
+    view = _constant_view()
     _, find = get_tool("rex_constant_find")
     result = find(_call(view), value=0x31337)
-    assert result["functions"] == [{"start": "0x1100", "name": "main", "addresses": ["0x1140"]}]
-    result = find(_call(view), value=0x1234)
-    assert result["functions"][0]["addresses"] == ["0x1150"]
+    assert result == {
+        "truncated": False,
+        "functions": [
+            {"start": "0x1100", "name": "main", "addresses": ["0x1140", "0x1150"]},
+            {"start": "0x2000", "name": "handler", "addresses": ["0x2050"]},
+        ],
+    }
+    assert find(_call(view), value=0x1234)["functions"][0]["addresses"] == ["0x3010"]
+
+
+def test_constant_find_skips_lines_outside_functions() -> None:
+    view = _constant_view()
+    view.constant_references.append((7, 0x9000, None))
+    _, find = get_tool("rex_constant_find")
+    assert find(_call(view), value=7) == {"truncated": False, "functions": []}
 
 
 def test_constant_find_caps_matches_per_function() -> None:
-    operation = binaryninja.MediumLevelILOperation
-    instructions = [
-        make_mlil_instruction(operation.MLIL_CONST, constant=7, address=0x3000 + index)
-        for index in range(7)
-    ]
+    function = FakeFunction("sink", 0x3000, 0x3100)
     view = FakeBinaryView(
-        functions=[FakeFunction("sink", 0x3000, 0x3100, mlil=FakeMLIL(instructions))]
+        functions=[function],
+        constant_references=[(7, 0x3000 + index, function) for index in range(7)],
     )
     _, find = get_tool("rex_constant_find")
     result = find(_call(view), value=7)
@@ -326,37 +352,63 @@ def test_constant_find_caps_matches_per_function() -> None:
 
 
 def test_constant_find_zero_limit_returns_nothing() -> None:
-    operation = binaryninja.MediumLevelILOperation
-    view = FakeBinaryView(
-        functions=[
-            FakeFunction(
-                "f",
-                0x1000,
-                0x1010,
-                mlil=FakeMLIL(
-                    [make_mlil_instruction(operation.MLIL_CONST, constant=1, address=0x1008)]
-                ),
-            )
-        ]
-    )
+    function = FakeFunction("f", 0x1000, 0x1010)
+    view = FakeBinaryView(functions=[function], constant_references=[(1, 0x1008, function)])
     _, find = get_tool("rex_constant_find")
     assert find(_call(view), value=1, limit=0) == {"truncated": True, "functions": []}
 
 
-def test_constant_find_filter_and_limit() -> None:
-    operation = binaryninja.MediumLevelILOperation
-    sink_mlil = FakeMLIL(
-        [make_mlil_instruction(operation.MLIL_CONST, constant=0x31337, address=0x3010)]
-    )
-    view = _view_with_functions()
-    view.functions.append(FakeFunction("sink2", 0x3000, 0x3100, mlil=sink_mlil))
+def test_constant_find_offset_and_limit() -> None:
+    view = _constant_view()
     _, find = get_tool("rex_constant_find")
-    assert find(_call(view), value=0x31337, function_filter="HANDLER")["functions"] == []
-    filtered = find(_call(view), value=0x31337, function_filter="^main$")
-    assert len(filtered["functions"]) == 1
     limited = find(_call(view), value=0x31337, limit=1)
     assert limited["truncated"] is True
-    assert len(limited["functions"]) == 1
+    assert [entry["name"] for entry in limited["functions"]] == ["main"]
+    paged = find(_call(view), value=0x31337, limit=1, offset=1)
+    assert paged["truncated"] is False
+    assert [entry["name"] for entry in paged["functions"]] == ["handler"]
+    assert find(_call(view), value=0x31337, function_filter="nomatch")["functions"] == []
+    filtered = find(_call(view), value=0x31337, function_filter="^main$")
+    assert [entry["name"] for entry in filtered["functions"]] == ["main"]
+    assert find(_call(view), value=0x31337, limit=5, offset=5) == {
+        "truncated": False,
+        "functions": [],
+    }
+
+
+def test_constant_find_stops_the_scan_at_the_limit() -> None:
+    functions = [
+        FakeFunction(f"f{index}", 0x1000 + index * 0x10, 0x1010 + index * 0x10)
+        for index in range(5)
+    ]
+    view = FakeBinaryView(
+        functions=functions,
+        constant_references=[(1, function.start + 8, function) for function in functions],
+    )
+    _, find = get_tool("rex_constant_find")
+    result = find(_call(view), value=1, limit=2)
+    assert result["truncated"] is True
+    assert len(result["functions"]) == 2
+    # The window holds 2 functions and the next match proves more exist; the scan
+    # must have stopped there instead of running to the end of the view.
+    assert view.constant_scan_yields == 3
+    # The decline must reach the search as an abort, not just stop the local loop.
+    assert view.constant_scan_aborted is True
+
+
+def test_constant_find_rejects_out_of_range_value() -> None:
+    view = _constant_view()
+    _, find = get_tool("rex_constant_find")
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), value=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'value': Must be at least 0"
+    with pytest.raises(FakeToolError) as exc:
+        find(_call(view), value=2**64)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == (
+        f"Invalid integer parameter 'value': Must be at most {tools._MAX_CONSTANT_VALUE}"
+    )
 
 
 def test_constant_find_rejects_out_of_range_limit() -> None:
@@ -375,19 +427,16 @@ def test_constant_find_rejects_out_of_range_limit() -> None:
 
 
 def test_constant_find_caps_limit_and_truncates_names() -> None:
-    operation = binaryninja.MediumLevelILOperation
-
-    def matching_function(name: str, start: int) -> FakeFunction:
-        mlil = FakeMLIL(
-            [make_mlil_instruction(operation.MLIL_CONST, constant=1, address=start + 8)]
-        )
-        return FakeFunction(name, start, start + 0x10, mlil=mlil)
-
     functions = [
-        matching_function("f" * 1000 if index == 0 else f"f{index}", 0x1000 + index * 0x10)
+        FakeFunction(
+            "f" * 1000 if index == 0 else f"f{index}", 0x1000 + index * 0x10, 0x1010 + index * 0x10
+        )
         for index in range(tools._MAX_LIMIT + 100)
     ]
-    view = FakeBinaryView(functions=functions)
+    view = FakeBinaryView(
+        functions=functions,
+        constant_references=[(1, function.start + 8, function) for function in functions],
+    )
     _, find = get_tool("rex_constant_find")
     result = find(_call(view), value=1, limit=tools._MAX_LIMIT)
     assert len(result["functions"]) == tools._MAX_LIMIT
@@ -447,6 +496,7 @@ def test_hlil_grep_caps_lines_per_function() -> None:
                 "lines": [f"call rax_{index}" for index in range(3)],
             }
         ],
+        "next_offset": None,
     }
 
 
@@ -461,7 +511,7 @@ def test_hlil_grep_limits_and_errors() -> None:
     assert limited["truncated"] is True
     assert limited["functions"] == []
     zero_scan = grep(_call(view), ".", max_functions=0)
-    assert zero_scan == {"scanned": 0, "truncated": True, "functions": []}
+    assert zero_scan == {"scanned": 0, "truncated": True, "functions": [], "next_offset": 0}
     with pytest.raises(FakeToolError) as exc:
         grep(_call(view), "(")
     assert exc.value.code == "invalid_regex"
@@ -526,6 +576,43 @@ def test_hlil_grep_caps_limit_and_max_functions() -> None:
     )
     assert scanned_result["scanned"] == tools._MAX_HLIL_GREP_FUNCTIONS
     assert scanned_result["truncated"] is True
+
+
+def test_hlil_grep_offset_and_next_offset() -> None:
+    functions = [
+        FakeFunction(
+            f"a{index}",
+            0x1000 + index * 0x10,
+            0x1010 + index * 0x10,
+            hlil=RenderableText("call ax\n"),
+        )
+        for index in range(4)
+    ]
+    view = FakeBinaryView(functions=functions)
+    _, grep = get_tool("rex_hlil_grep")
+    paged = grep(_call(view), "call", limit=2, offset=1)
+    assert paged == {
+        "scanned": 2,
+        "truncated": True,
+        "functions": [
+            {"start": hex(0x1000 + index * 0x10), "name": f"a{index}", "lines": ["call ax"]}
+            for index in (1, 2)
+        ],
+        "next_offset": 3,
+    }
+    resumed = grep(_call(view), "call", limit=2, offset=3)
+    assert resumed == {
+        "scanned": 1,
+        "truncated": False,
+        "functions": [{"start": "0x1030", "name": "a3", "lines": ["call ax"]}],
+        "next_offset": None,
+    }
+    beyond = grep(_call(view), "call", offset=10)
+    assert beyond == {"scanned": 0, "truncated": False, "functions": [], "next_offset": None}
+    with pytest.raises(FakeToolError) as exc:
+        grep(_call(view), "call", offset=-1)
+    assert exc.value.code == "invalid_params"
+    assert exc.value.message == "Invalid integer parameter 'offset': Must be at least 0"
 
 
 def test_memory_write_validates_and_writes() -> None:
