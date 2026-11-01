@@ -28,7 +28,7 @@ if [ -d "${HOME}/.cargo/bin" ]; then
 fi
 # Real-core mode (default features): links against the BN install discovered
 # via BINARYNINJADIR or ~/.binaryninja/lastrun. Requires clang (bindgen).
-cargo build --release
+cargo build --release --locked
 
 install -m 0755 target/release/libbinja_plugin_native.so "${INSTALLED_SO}"
 

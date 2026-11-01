@@ -3,7 +3,12 @@ fn main() {
         .expect("DEP_BINARYNINJACORE_PATH not specified");
 
     println!("cargo::rustc-link-lib=dylib=binaryninjacore");
-    println!("cargo::rustc-link-search={}", link_path.to_str().unwrap());
+    println!(
+        "cargo::rustc-link-search={}",
+        link_path
+            .to_str()
+            .expect("DEP_BINARYNINJACORE_PATH is not valid UTF-8")
+    );
 
     #[cfg(target_os = "linux")]
     {

@@ -1,4 +1,4 @@
-//! rx_native_poc: native-speed MCP tools for Binary Ninja (proof of concept).
+//! binja_plugin_native: native-speed MCP tools for Binary Ninja.
 //!
 //! Registers two BinaryView-scoped MCP tools:
 //!
@@ -23,7 +23,7 @@ pub extern "C" fn CorePluginInit() -> bool {
         true
     } else {
         binaryninja::logger::bn_log(
-            "rx_native_poc",
+            "binja_plugin_native",
             binaryninja::logger::BnLogLevel::ErrorLog,
             "failed to register rx_data_find / rx_multi_find MCP tools",
         );

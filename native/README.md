@@ -16,6 +16,30 @@ Everything else stays in Python deliberately: the other tools wrap single core
 calls (analysis, HLIL rendering, constant search) whose cost is inside
 Binary Ninja itself, so a rewrite would change nothing but the language.
 
+## Known divergences from the Python tool
+
+`rx_data_find` mirrors `rex_data_find`'s client-visible contract (result shape,
+pagination, error codes, error text). Three deliberate divergences remain; none
+changes an error code a client branches on:
+
+1. **Out-of-range integers are rejected at the serde layer.** Negative or
+   oversized `limit`/`offset` fail deserialization with `invalid_params` and
+   serde's message text instead of the Python "Must be at least 0" wording;
+   the unsigned Rust argument types make the lower-bound check unreachable,
+   so the code matches but the wording cannot without duplicating serde's job.
+2. **`offset` beyond `u64::MAX` is rejected.** Python's bignums accept
+   arbitrarily large offsets; Rust rejects them at deserialization. u64 spans
+   the entire addressable space, so such an offset can never name a real page.
+3. **Hex token parsing is stricter.** Python's `int(token, 16)` accepts `"+4"`
+   and exotic Unicode digits, and crashes with an uncaught `ValueError` (a
+   500, not a tool error) on `"-1"`; Rust rejects all three uniformly with
+   `invalid_pattern` — strictly better, and pinned deliberately by
+   `rejects_bad_tokens`.
+
+Error precedence is aligned, not divergent: both resolve the binary view
+before validating pagination and pattern, so multi-error invocations surface
+the same first error.
+
 ## Build modes
 
 - **Real-core mode** (default features): links against `libbinaryninjacore`
@@ -62,5 +86,6 @@ native/scripts/install.sh  # real-core release build + flat install
 ```
 
 `native/BENCH.md` is the live benchmark protocol; run it after any engine
-change. The differential tests (both scanners against a naive reference matcher
-on 500 seeded random cases each) run in both build modes.
+change. The differential tests (each scanner against a naive reference matcher
+on seeded random cases: 200 single-pattern, 300 multi-pattern) run in both
+build modes.
