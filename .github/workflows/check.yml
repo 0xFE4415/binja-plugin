@@ -14,7 +14,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  markdown:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Lint Markdown
+        uses: DavidAnson/markdownlint-cli2-action@v25
+        with:
+          globs: "**/*.md"
+
   check:
+    needs: markdown
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -23,10 +36,6 @@ jobs:
         uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.13"
-      - name: Lint Markdown
-        uses: DavidAnson/markdownlint-cli2-action@v25
-        with:
-          globs: "**/*.md"
       - name: Format
         run: uvx nox -s format
       - name: Ruff
@@ -39,6 +48,7 @@ jobs:
         run: uvx nox -s test
 
   native:
+    needs: markdown
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -74,6 +84,7 @@ jobs:
         run: uvx nox -s native
 
   mutation-python:
+    needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -86,6 +97,7 @@ jobs:
         run: uvx nox -s mutation
 
   mutation-native:
+    needs: [check, native]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
